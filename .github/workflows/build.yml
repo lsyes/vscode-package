@@ -1,0 +1,136 @@
+name: build-loong64
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Upstream VS Code version
+        required: false
+        default: latest
+      publish:
+        description: Publish the generated release
+        type: boolean
+        default: true
+  push:
+    tags:
+      - "v*-loong64"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vscode-loong64
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e '.[dev]'
+      - run: python -m pytest -q
+
+  build:
+    needs: check
+    runs-on: [self-hosted, linux, loong64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential binutils pkg-config python3-dev \
+            ar tar xz-utils zstd jq curl gh \
+            nodejs npm \
+            gcc-loongarch64-linux-gnu g++-loongarch64-linux-gnu \
+            musl-dev musl-tools libgcc-16-dev \
+            libxkbcommon-dev libxkbfile-dev libkrb5-dev krb5-multidev
+      - name: Install Rust targets
+        run: |
+          rustup target add loongarch64-unknown-linux-gnu
+          rustup target add loongarch64-unknown-linux-musl
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e '.[dev]'
+      - name: Resolve upstream release
+        id: upstream
+        run: |
+          python -m vscode_loong64.cli info "${{ inputs.version || 'latest' }}" > release.json
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          data = json.load(open("release.json"))
+          print(f"version={data['version']}")
+          print(f"tag={data['tag']}")
+          print(f"url={data['url']}")
+          print(f"sha256={data['sha256'] or ''}")
+          PY
+      - name: Check existing release
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.upstream.outputs.tag }}" --json tagName >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Download upstream installer
+        if: steps.existing.outputs.exists != 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          mkdir -p .cache/downloads .cache/electron-loong64
+          curl -fL --retry 4 --retry-delay 3 \
+            --output .cache/downloads/code.tar.gz \
+            "${{ steps.upstream.outputs.url }}"
+          echo "${{ steps.upstream.outputs.sha256 }}  .cache/downloads/code.tar.gz" | sha256sum -c -
+      - name: Build, stage, and package
+        if: steps.existing.outputs.exists != 'true' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python -m vscode_loong64.cli build "${{ steps.upstream.outputs.version }}" \
+            --upstream .cache/downloads/code.tar.gz \
+            --formats tar.gz,deb \
+            --jobs "$(nproc)" \
+            --no-smoke-test
+      - name: Verify native artifacts and architecture
+        if: steps.existing.outputs.exists != 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          test -f .cache/tools/rg
+          test -z "$(readelf -d .cache/tools/rg | grep NEEDED || true)"
+          test -z "$(readelf -l .cache/tools/rg | grep INTERP || true)"
+          proxy=$(find work/build/stage/resources/app/node_modules/@vscode -name os_proxy_resolver.node | head -n1)
+          test -n "$proxy"
+          readelf -d "$proxy" | grep -q 'NEEDED.*libc\.so'
+          test -z "$(readelf -l "$proxy" | grep INTERP || true)"
+          PROXY_BINDING=$(realpath "$proxy") ELECTRON_RUN_AS_NODE=1 work/build/stage/code -e \
+            "const m = require(process.env.PROXY_BINDING); if (typeof m.ProxyResolver !== 'function') process.exit(1)"
+          for deb in dist/*.deb; do
+            test -f "$deb"
+            dpkg-deb --info "$deb" | grep -q 'Architecture: loong64'
+          done
+      - name: Publish release
+        if: |
+          (steps.existing.outputs.exists != 'true' || github.event_name == 'workflow_dispatch') &&
+          github.event_name != 'pull_request' &&
+          (github.event_name != 'workflow_dispatch' || inputs.publish)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python -m vscode_loong64.cli publish \
+            --manifest dist/manifest.json \
+            --tag "${{ steps.upstream.outputs.tag }}"
+      - uses: actions/upload-artifact@v4
+        if: steps.existing.outputs.exists != 'true' || github.event_name == 'workflow_dispatch'
+        with:
+          name: vscode-loong64-${{ steps.upstream.outputs.version }}
+          path: |
+            dist/*
+            work/logs/*
+          if-no-files-found: error

@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vscode-loong64-builder"
+version = "0.1.0"
+description = "Build upstream Visual Studio Code for the LoongArch (loong64) architecture from official Microsoft binaries."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "vscode-loong64-builder contributors" }]
+keywords = ["vscode", "loongarch", "loong64", "electron", "packaging"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX :: Linux",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "pytest-cov>=4"]
+
+[project.scripts]
+vscode-loong64 = "vscode_loong64.cli:main"
+vscl = "vscode_loong64.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/lsyes/vscode-package"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+vscode_loong64 = ["templates/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+pythonpath = ["src"]
