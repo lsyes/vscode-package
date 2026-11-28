@@ -333,7 +333,7 @@ split that the missing LoongArch runners require:
 
 | Job | Runner | What it does |
 | --- | --- | --- |
-| `check` | `ubuntu-latest` | `make check` (syntax + 71 unit tests) |
+| `check` | `ubuntu-latest` | `make check` (syntax + 78 unit tests, including the CI shell guards) |
 | `payloads` | `self-hosted, linux, loong64` | **optional** (`build_payloads`): rebuilds the addons/ripgrep/helpers and uploads `dist/loong64-prebuilts-*.tar.gz` as an artifact |
 | `package` | `ubuntu-latest` | downloads the bundle **that was uploaded by hand**, runs `make deb-from-bundle`, re-checks the manifest and the four helpers, uploads the `.deb`, publishes |
 
