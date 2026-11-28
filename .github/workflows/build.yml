@@ -218,7 +218,13 @@ jobs:
                      -O "dist/${EXPLICIT}" --clobber
                 ;;
             esac
-            archive=$(ls dist/loong64-prebuilts-*.tar.gz | head -1)
+            shopt -s nullglob
+            downloaded=(dist/loong64-prebuilts-*.tar.gz)
+            if [ ${#downloaded[@]} -eq 0 ]; then
+              echo 'no bundle was downloaded' >&2
+              exit 1
+            fi
+            archive=${downloaded[0]}
           else
             # newest bundle asset for the requested version (or overall); the
             # lookup walks every release, because the bundle is uploaded by hand
@@ -275,10 +281,18 @@ jobs:
           PY
           deb=$(ls dist/*.deb)
           test "$(dpkg-deb -f "$deb" Architecture)" = loong64
-          dpkg-deb -c "$deb" | grep -q './usr/share/code/bin/code-tunnel$'
-          dpkg-deb -c "$deb" | grep -q './usr/share/code/bin/copilot-shim/copilot$'
-          dpkg-deb -c "$deb" | grep -q 'vendor/seccomp/loong64/apply-seccomp$'
-          dpkg-deb -c "$deb" | grep -q 'vsce-sign/bin/vsce-sign$'
+          # list once: piping into ``grep -q`` closes the pipe early, and with
+          # ``pipefail`` that turns dpkg-deb's EPIPE into a failed step
+          dpkg-deb -c "$deb" > contents.txt
+          for path in \
+            './usr/share/code/bin/code-tunnel' \
+            './usr/share/code/bin/copilot-shim/copilot' \
+            'vendor/seccomp/loong64/apply-seccomp' \
+            'vsce-sign/bin/vsce-sign'; do
+            grep -q -- "$path$" contents.txt \
+              || { echo "missing from the package: $path" >&2; exit 1; }
+          done
+          echo 'all four standalone helpers are in the package'
 
       - uses: actions/upload-artifact@v4
         with:
