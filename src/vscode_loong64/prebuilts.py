@@ -31,6 +31,7 @@ is not a LoongArch64 ELF.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import tarfile
 import time
@@ -312,20 +313,20 @@ BUNDLE_TAG = "loong64-prebuilts"
 
 
 def fetch(
-    version: str,
+    version: Optional[str] = None,
     electron: str = "auto",
     repo: Optional[str] = None,
     tag: Optional[str] = None,
     dest: Optional[Path] = None,
 ) -> Path:
-    """Download a bundle published by a ``--emit-prebuilt-bundle`` build.
+    """Download a bundle uploaded to the ``loong64-prebuilts`` release.
 
-    ``electron`` may be ``auto``, in which case the newest asset for ``version``
-    is taken; the caller then has to check compatibility with
-    :func:`check_compatible`.
+    ``version`` may be ``None`` (or ``"latest"``), in which case the newest asset
+    is taken; ``electron`` narrows that further.  The bundle is built by hand on
+    a LoongArch machine and uploaded as a release asset, so the caller has to
+    check compatibility with :func:`check_compatible` when the version was
+    inferred instead of requested.
     """
-
-    import os
 
     from . import utils
 
@@ -333,25 +334,60 @@ def fetch(
     if not repo:
         raise BuildError("no repository: pass --repo owner/name or set GITHUB_REPOSITORY")
     tag = tag or BUNDLE_TAG
-    release = utils.http_get_json(f"https://api.github.com/repos/{repo}/releases/tags/{tag}")
-    assets = release.get("assets") if isinstance(release, dict) else None
+    # an unauthenticated request is rate limited to a handful of calls per
+    # minute, which a CI run shares with every other job on the runner
+    headers: Dict[str, str] = {}
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    assets: List[Dict[str, object]] = []
+    release: Optional[Dict[str, object]] = None
+    try:
+        release = utils.http_get_json(
+            f"https://api.github.com/repos/{repo}/releases/tags/{tag}",
+            headers=headers or None,
+        )
+        assets = list((release or {}).get("assets") or [])  # type: ignore[arg-type]
+    except BuildError as exc:
+        utils.debug("release %s not found (%s); scanning all releases", tag, exc)
     if not assets:
-        raise BuildError(f"release {tag} of {repo} has no assets")
-    prefix = f"loong64-prebuilts-{version}-electron"
-    matches = [
-        asset
-        for asset in assets
-        if str(asset.get("name", "")).startswith(prefix) and str(asset.get("name", "")).endswith(".tar.gz")
-    ]
+        # the bundle is uploaded by hand, so it may live in any release (a
+        # version tag, a draft, or the dedicated bundle release)
+        assets = _all_assets(repo, headers)
+    if not assets:
+        raise BuildError(
+            f"{repo} has no release assets yet; upload "
+            "dist/loong64-prebuilts-*.tar.gz to a release first"
+        )
+    available = ", ".join(str(a.get("name")) for a in assets[:10])
+    if not version or version in ("", "latest"):
+        matches = [
+            asset
+            for asset in assets
+            if str(asset.get("name", "")).startswith("loong64-prebuilts-")
+            and str(asset.get("name", "")).endswith("-loong64.tar.gz")
+        ]
+    else:
+        prefix = f"loong64-prebuilts-{version}-electron"
+        matches = [
+            asset
+            for asset in assets
+            if str(asset.get("name", "")).startswith(prefix)
+            and str(asset.get("name", "")).endswith("-loong64.tar.gz")
+        ]
     if electron and electron != "auto":
         matches = [a for a in matches if f"electron{electron}-" in str(a.get("name"))]
     if not matches:
-        available = ", ".join(str(a.get("name")) for a in assets[:10])
         raise BuildError(
-            f"no bundle for VSCode {version}/Electron {electron} in {repo}#{tag} (assets: {available})"
+            f"no bundle for VSCode {version or 'latest'}/Electron {electron} "
+            f"in {repo}#{tag} (assets: {available})"
         )
     asset = sorted(matches, key=lambda a: str(a.get("name")))[-1]
-    target = Path(dest or Path("dist") / str(asset["name"]))
+    base = Path(dest or Path("dist"))
+    if base.suffix == ".tar.gz":
+        target = base
+    else:
+        target = base / str(asset["name"])
     target.parent.mkdir(parents=True, exist_ok=True)
     url = str(asset.get("browser_download_url") or "")
     if not url:
@@ -359,6 +395,81 @@ def fetch(
     utils.download(url, target)
     log("downloaded bundle %s", target)
     return target
+
+
+def upload(
+    archive: Path,
+    repo: Optional[str] = None,
+    tag: Optional[str] = None,
+    token: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> List[str]:
+    """Attach a hand-built bundle to the ``loong64-prebuilts`` release.
+
+    Uses the same ``gh``-then-REST publishing path as the release workflow, so
+    a machine with a token can upload the bundle without installing anything
+    else.  The release is created on first use.
+    """
+
+    from .publish import Publisher
+
+    archive = Path(archive).expanduser().resolve()
+    if not archive.exists():
+        raise BuildError(f"bundle not found: {archive}")
+    meta = describe(archive)
+    repo = repo or os.environ.get("GITHUB_REPOSITORY")
+    if not repo:
+        raise BuildError("no repository: pass --repo owner/name or set GITHUB_REPOSITORY")
+    tag = tag or BUNDLE_TAG
+    body = notes or (
+        "Architecture specific payloads consumed by the packaging workflow: "
+        "native addons, ripgrep (static musl) and the four standalone helpers "
+        "(`bin/code-tunnel`, `bin/copilot-shim/copilot`, `apply-seccomp`, `vsce-sign`). "
+        "Built on a LoongArch machine with `make bundle`."
+    )
+    publisher = Publisher(
+        repo=repo,
+        tag=tag,
+        token=token,
+        title="LoongArch64 payloads",
+        body=body,
+    )
+    publisher.ensure_release()
+    names = publisher.upload([archive])
+    log(
+        "uploaded %s (%s) to %s#%s",
+        archive.name,
+        human_size(archive.stat().st_size),
+        repo,
+        tag,
+    )
+    utils.debug("bundle metadata: %s", meta)
+    return names
+
+
+def _all_assets(repo: str, headers: Dict[str, str]) -> List[Dict[str, object]]:
+    """Collect the assets of every release, newest release first."""
+
+    from . import utils
+
+    try:
+        releases = utils.http_get_json(
+            f"https://api.github.com/repos/{repo}/releases?per_page=100",
+            headers=headers or None,
+        )
+    except BuildError as exc:
+        warn("unable to list releases of %s: %s", repo, exc)
+        return []
+    if not isinstance(releases, list):
+        return []
+    assets: List[Dict[str, object]] = []
+    for release in releases:
+        if not isinstance(release, dict):
+            continue
+        for asset in release.get("assets") or []:
+            if isinstance(asset, dict):
+                assets.append(asset)
+    return assets
 
 
 def describe(archive: Path) -> Dict[str, object]:

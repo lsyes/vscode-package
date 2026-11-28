@@ -79,10 +79,22 @@ build, so the packaging host needs no cross toolchain:
 make bundle VERSION=1.148.0
 #    dist/loong64-prebuilts-1.148.0-electron43.7.7-loong64.tar.gz
 
-# 2. on any x86-64 machine
-make deb-from-bundle VERSION=1.148.0 \
-  BUNDLE=dist/loong64-prebuilts-1.148.0-electron43.7.7-loong64.tar.gz
+# 2. upload it once, by hand, as a release asset (needs GH_TOKEN/GITHUB_TOKEN)
+vscode-loong64 prebuilts upload \
+  dist/loong64-prebuilts-1.148.0-electron43.7.7-loong64.tar.gz \
+  --repo lsyes/vscode-package
+#    or drag the file into the GitHub UI
+
+# 3. on any x86-64 machine, pick the newest uploaded bundle automatically
+make deb-from-bundle VERSION=1.148.0 BUNDLE=$(ls dist/loong64-prebuilts-*.tar.gz | tail -1)
+
+# ... or straight from the release
+vscode-loong64 prebuilts fetch --version 1.148.0 --repo lsyes/vscode-package --dest dist
 ```
+
+`prebuilts fetch` takes the newest asset when `--version` is omitted and looks
+at every release (the dedicated `loong64-prebuilts` release first, then any
+version release), so a bundle dragged into the GitHub UI is picked up as well.
 
 A bundle is a flat tar.gz of
 
@@ -321,15 +333,15 @@ split that the missing LoongArch runners require:
 
 | Job | Runner | What it does |
 | --- | --- | --- |
-| `check` | `ubuntu-latest` | `make check` (syntax + 65 unit tests) |
-| `payloads` | `self-hosted, linux, loong64` | resolves the release, rebuilds the addons/ripgrep/helpers, publishes `dist/loong64-prebuilts-*.tar.gz` to the rolling `loong64-prebuilts` release |
-| `package` | `ubuntu-latest` | downloads the bundle, runs `make deb-from-bundle`, re-checks the manifest and the four helpers, uploads the `.deb`, publishes |
+| `check` | `ubuntu-latest` | `make check` (syntax + 71 unit tests) |
+| `payloads` | `self-hosted, linux, loong64` | **optional** (`build_payloads`): rebuilds the addons/ripgrep/helpers and uploads `dist/loong64-prebuilts-*.tar.gz` as an artifact |
+| `package` | `ubuntu-latest` | downloads the bundle **that was uploaded by hand**, runs `make deb-from-bundle`, re-checks the manifest and the four helpers, uploads the `.deb`, publishes |
 
-The `payloads` job reuses an existing bundle for the same upstream version
-unless `force` is set, and caches `.cache/prebuilts`, `.cache/sources`,
-`.cache/cargo`, `.cache/dotnet` and `.cache/tools` between runs, so a warm
-LoongArch runner only recompiles what actually changed. Triggers: manual
-dispatch, `v*-loong64` tags, and a daily schedule.
+The workflow is packaging-only by default: the bundle has to exist as a release
+asset first (see the command above). `package` accepts `bundle` as an asset name
+or a direct URL, and otherwise takes the newest bundle for the requested
+version. Triggers: manual dispatch, `v*-loong64` tags, and a weekly packaging
+check.
 
 Independently of where they run, the builder itself already:
 

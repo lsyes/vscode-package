@@ -1,37 +1,46 @@
 name: build
 
-# Two-stage build for LoongArch64.
+# Packaging-only workflow.
 #
-# `payloads` compiles everything that is architecture specific (native addons,
-# ripgrep and the four standalone helpers: code-tunnel, copilot-shim,
-# apply-seccomp, vsce-sign) on a self-hosted LoongArch runner and publishes a
-# portable bundle.  `package` then runs on an ordinary ubuntu-latest runner,
-# consumes that bundle and only stages, verifies and packages - no compiler is
-# needed there, which is the only way to build on GitHub, since it does not
-# host LoongArch runners.
+# GitHub does not host LoongArch runners, so the architecture specific payloads
+# (native addons, ripgrep and the four standalone helpers: code-tunnel,
+# copilot-shim, apply-seccomp, vsce-sign) are built separately and uploaded
+# BY HAND as one asset of the `loong64-prebuilts` release:
+#
+#   dist/loong64-prebuilts-<version>-electron<electron>-loong64.tar.gz
+#
+# This workflow then downloads that asset, stages it, verifies the result and
+# writes the `.deb` on a plain ubuntu-latest runner.  No compiler is installed,
+# so a missing or stale payload fails loudly instead of silently degrading.
+#
+# The optional `payloads` job reproduces the bundle on a self-hosted LoongArch
+# runner; it is disabled unless `build_payloads` is ticked.
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Upstream version (blank = latest stable)'
+        description: 'Upstream version (blank = take it from the bundle asset)'
+        required: false
+        default: ''
+      bundle:
+        description: 'Bundle asset name or URL (blank = newest for the version)'
         required: false
         default: ''
       publish:
         description: 'Publish a GitHub release'
         type: boolean
         default: true
-      force:
-        description: 'Rebuild the payload bundle even when one already exists'
+      build_payloads:
+        description: 'Also rebuild the payload bundle (needs a self-hosted loong64 runner)'
         type: boolean
         default: false
   push:
     tags:
       - 'v*-loong64'
   schedule:
-    # daily at 02:41 UTC: rebuild the payloads when upstream releases, then
-    # package them
-    - cron: '41 2 * * *'
+    # weekly packaging check of the newest uploaded bundle, Mondays 04:17 UTC
+    - cron: '17 4 * * 1'
 
 permissions:
   contents: write
@@ -68,17 +77,13 @@ jobs:
           make check
 
   # ---------------------------------------------------------------------------
-  # architecture specific payloads: runs on a LoongArch host
+  # optional: rebuild the payload bundle on a LoongArch host
   # ---------------------------------------------------------------------------
   payloads:
     needs: check
+    if: ${{ inputs.build_payloads }}
     runs-on: [self-hosted, linux, loong64]
     timeout-minutes: 300
-    outputs:
-      version: ${{ steps.target.outputs.version }}
-      commit: ${{ steps.target.outputs.commit }}
-      archive: ${{ steps.bundle.outputs.archive }}
-      reused: ${{ steps.exists.outputs.found }}
     steps:
       - uses: actions/checkout@v4
 
@@ -111,8 +116,6 @@ jobs:
       - name: Restore payload caches
         uses: actions/cache@v4
         with:
-          # helper prebuilts, the fetched cli/ + copilot_shim/ sources, the cargo
-          # registry and the downloaded LoongArch .NET SDK are all reusable
           path: |
             .cache/prebuilts
             .cache/sources
@@ -123,58 +126,15 @@ jobs:
           restore-keys: |
             payloads-
 
-      - name: Resolve the target release
-        id: target
+      - name: Build the payload bundle
         env:
           REQUESTED: ${{ inputs.version }}
         run: |
           set -euo pipefail
           . .venv/bin/activate
-          python -m vscode_loong64.cli info "${REQUESTED:-latest}" > info.json
-          python - <<'PY' >> "$GITHUB_OUTPUT"
-          import json
-          data = json.load(open("info.json"))
-          print("version=" + data["version"])
-          print("commit=" + data["commit"])
-          PY
+          make bundle VERSION="${REQUESTED:-latest}"
 
-      - name: Reuse an existing bundle
-        id: exists
-        if: ${{ !inputs.force }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ steps.target.outputs.version }}
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          prefix="loong64-prebuilts-${VERSION}-electron"
-          if gh release view "$BUNDLE_TAG" >/dev/null 2>&1; then
-            name=$(gh release view "$BUNDLE_TAG" --json assets --jq '.assets[].name' \
-                   | grep "^${prefix}" | head -1 || true)
-          else
-            name=""
-          fi
-          if [ -n "${name}" ]; then
-            echo "found=true" >> "$GITHUB_OUTPUT"
-            gh release download "$BUNDLE_TAG" -p "${name}" -O "dist/${name}" --clobber
-            echo "downloaded existing bundle ${name}"
-          else
-            echo "found=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Build the payload bundle
-        if: steps.exists.outputs.found != 'true'
-        env:
-          VERSION: ${{ steps.target.outputs.version }}
-        run: |
-          set -euo pipefail
-          . .venv/bin/activate
-          make bundle VERSION="$VERSION"
-
-      - name: Publish the payload bundle
-        if: steps.exists.outputs.found != 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload the bundle by hand
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -183,27 +143,17 @@ jobs:
             echo 'no bundle was produced' >&2
             exit 1
           fi
-          # one rolling release holds a bundle per upstream/Electron pair
-          gh release view "$BUNDLE_TAG" >/dev/null 2>&1 || \
-            gh release create "$BUNDLE_TAG" \
-              --title 'LoongArch64 payloads' \
-              --notes 'Architecture specific payloads (native addons, ripgrep, bin/code-tunnel, bin/copilot-shim/copilot, apply-seccomp, vsce-sign) consumed by the packaging job.'
-          gh release upload "$BUNDLE_TAG" "${bundles[@]}" --clobber
-
-      - name: Record the bundle path
-        id: bundle
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          bundles=(dist/loong64-prebuilts-*.tar.gz)
-          echo "archive=${bundles[0]}" >> "$GITHUB_OUTPUT"
-          . .venv/bin/activate
-          python -m vscode_loong64.cli prebuilts inspect "${bundles[0]}" > bundle.json
-          python - >> "$GITHUB_STEP_SUMMARY" <<'PY'
-          import json
-          data = json.load(open("bundle.json"))
-          print(f"- `{data['vscode']}` / Electron `{data['electron']}`: {len(data['entries'])} payloads")
-          PY
+          # the asset is what the packaging job consumes; publishing it needs a
+          # separate decision, so it is attached to the job summary only
+          {
+            echo '## Payload bundle'
+            echo
+            echo 'Upload this file as an asset of the `loong64-prebuilts` release:'
+            echo
+            echo '```'
+            echo "${bundles[0]}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -216,7 +166,7 @@ jobs:
   # packaging: runs on x86-64, never installs a compiler
   # ---------------------------------------------------------------------------
   package:
-    needs: payloads
+    needs: check
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -240,19 +190,65 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e '.[dev]'
 
-      - uses: actions/download-artifact@v4
-        with:
-          name: loong64-prebuilts
-          path: dist
-
-      - name: Package the Debian build
+      - name: Fetch the uploaded payload bundle
+        id: bundle
         env:
-          VERSION: ${{ needs.payloads.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPLICIT: ${{ inputs.bundle }}
+          REQUESTED: ${{ inputs.version }}
         run: |
           set -euo pipefail
           . .venv/bin/activate
-          bundle=$(ls dist/loong64-prebuilts-*.tar.gz | head -1)
-          make deb-from-bundle VERSION="$VERSION" BUNDLE="$bundle"
+          mkdir -p dist
+          if [ -n "${EXPLICIT}" ]; then
+            case "${EXPLICIT}" in
+              http*|https*)
+                name=$(basename "${EXPLICIT}")
+                curl -fL --retry 3 -o "dist/${name}" "${EXPLICIT}"
+                ;;
+              *)
+                # the bundle may be attached to the dedicated release or to a
+                # version release; try the bundle release first, then anything
+                gh release download "$BUNDLE_TAG" -p "${EXPLICIT}" \
+                  -O "dist/${EXPLICIT}" --clobber 2>/dev/null \
+                  || gh release download -p "${EXPLICIT}" \
+                     -O "dist/${EXPLICIT}" --clobber
+                ;;
+            esac
+            archive=$(ls dist/loong64-prebuilts-*.tar.gz | head -1)
+          else
+            # newest bundle asset for the requested version (or overall); the
+            # lookup walks every release, because the bundle is uploaded by hand
+            args=(--repo "$GITHUB_REPOSITORY" --dest dist)
+            if [ -n "${REQUESTED}" ]; then
+              args+=(--version "${REQUESTED}")
+            fi
+            python -m vscode_loong64.cli prebuilts fetch "${args[@]}" > fetch.json
+            archive=$(python -c 'import json; print(json.load(open("fetch.json"))["archive"])')
+          fi
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+          python -m vscode_loong64.cli prebuilts inspect "${archive}" > bundle.json
+          python - >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json
+          data = json.load(open("bundle.json"))
+          print("## Payload bundle")
+          print()
+          print(f"- VSCode `{data['vscode']}` / Electron `{data['electron']}` / `{data['arch']}`")
+          print(f"- {len(data['entries'])} payloads, schema {data['schema']}")
+          PY
+
+      - name: Package the Debian build
+        env:
+          VERSION: ${{ inputs.version }}
+          BUNDLE: ${{ steps.bundle.outputs.archive }}
+        run: |
+          set -euo pipefail
+          . .venv/bin/activate
+          # the bundle pins the upstream version; the input only overrides it
+          if [ -z "${VERSION}" ]; then
+            VERSION=$(python -c 'import json; print(json.load(open("bundle.json"))["vscode"])')
+          fi
+          make deb-from-bundle VERSION="$VERSION" BUNDLE="$BUNDLE"
 
       - name: Check the manifest and the package
         run: |

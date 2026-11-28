@@ -149,7 +149,7 @@ def build_parser() -> argparse.ArgumentParser:
     prebuilts_cmd = sub.add_parser(
         "prebuilts", help="inspect and fetch the portable LoongArch payload bundle"
     )
-    prebuilts_cmd.add_argument("action", choices=("inspect", "pack", "unpack", "fetch"))
+    prebuilts_cmd.add_argument("action", choices=("inspect", "pack", "unpack", "fetch", "upload"))
     prebuilts_cmd.add_argument("archive", nargs="?", type=Path, default=None)
     prebuilts_cmd.add_argument("--version", dest="bundle_version", default=None)
     prebuilts_cmd.add_argument("--electron", default=None)
@@ -157,6 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
     prebuilts_cmd.add_argument("--tag", default=None)
     prebuilts_cmd.add_argument("--dest", type=Path, default=None)
     prebuilts_cmd.add_argument("--json", action="store_true")
+    prebuilts_cmd.add_argument("--token", default=None, help="GitHub token for 'upload'")
 
     # -- check -------------------------------------------------------------------
     check = sub.add_parser("should-build", help="exit 0 when a new build is required")
@@ -424,11 +425,26 @@ def cmd_prebuilts(args: argparse.Namespace) -> int:
             "the bundle is written by 'build --emit-prebuilt-bundle' because it needs "
             "the compiled payloads; run that on a LoongArch host"
         )
+    if args.action == "upload":
+        if not args.archive:
+            raise BuildError("prebuilts upload requires the bundle path")
+        names = prebuilts.upload(
+            args.archive,
+            repo=args.repo,
+            tag=args.tag,
+            token=args.token,
+        )
+        print(json.dumps({"uploaded": names, "tag": args.tag or prebuilts.BUNDLE_TAG}, indent=2))
+        return 0
     if args.action == "fetch":
-        if not args.version:
-            raise BuildError("prebuilts fetch requires --version")
         runtime = args.electron or "auto"
-        path = prebuilts.fetch(args.version, runtime, repo=args.repo, tag=args.tag, dest=args.dest)
+        path = prebuilts.fetch(
+            args.bundle_version,
+            runtime,
+            repo=args.repo,
+            tag=args.tag,
+            dest=args.dest,
+        )
         print(json.dumps({"archive": str(path)}, indent=2))
         return 0
     raise BuildError(f"unknown prebuilts action: {args.action}")

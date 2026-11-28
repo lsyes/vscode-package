@@ -164,3 +164,105 @@ def test_safe_name_encodes_scoped_packages() -> None:
     assert prebuilts.safe_name("@parcel/watcher") == "parcel__watcher"
     assert prebuilts.safe_name("node-pty") == "node-pty"
     assert "/" not in prebuilts.safe_name("@vscode/sqlite3")
+
+
+def test_bundle_upload_reports_missing_file(tmp_path: Path) -> None:
+    with pytest.raises(Exception) as excinfo:
+        prebuilts.upload(tmp_path / "nope.tar.gz", repo="o/r")
+    assert "not found" in str(excinfo.value)
+
+
+def test_bundle_upload_requires_a_repository(tmp_path: Path, monkeypatch) -> None:
+    config = _config(tmp_path)
+    payloads = _payloads(tmp_path)
+    archive = prebuilts.pack(
+        config,
+        "1.148.0",
+        "43.7.7",
+        {"code-tunnel": payloads["helpers/code-tunnel/code"]},
+        {"ripgrep": payloads["rg"]},
+    )
+    monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
+    with pytest.raises(Exception) as excinfo:
+        prebuilts.upload(archive, token="x")
+    assert "repository" in str(excinfo.value)
+
+
+def test_bundle_upload_uses_the_publisher(tmp_path: Path, monkeypatch) -> None:
+    config = _config(tmp_path)
+    payloads = _payloads(tmp_path)
+    archive = prebuilts.pack(
+        config,
+        "1.148.0",
+        "43.7.7",
+        {"code-tunnel": payloads["helpers/code-tunnel/code"]},
+        {"ripgrep": payloads["rg"]},
+    )
+    calls = {}
+
+    class FakePublisher:
+        def __init__(self, **kwargs):
+            calls["init"] = kwargs
+
+        def ensure_release(self):
+            calls["ensure"] = True
+
+        def upload(self, files):
+            calls["files"] = [str(f) for f in files]
+            return [Path(f).name for f in files]
+
+    import vscode_loong64.publish as publish_module
+
+    monkeypatch.setattr(publish_module, "Publisher", FakePublisher)
+    names = prebuilts.upload(archive, repo="owner/name")
+    assert calls["ensure"] is True
+    assert calls["init"]["tag"] == prebuilts.BUNDLE_TAG
+    assert names == [archive.name]
+
+
+def test_fetch_reports_a_missing_release(tmp_path: Path, monkeypatch) -> None:
+    from vscode_loong64 import utils
+
+    def boom(url, **kwargs):
+        raise utils.BuildError(f"unable to fetch JSON from {url}: HTTP Error 404")
+
+    monkeypatch.setattr(utils, "http_get_json", boom)
+    with pytest.raises(Exception) as excinfo:
+        prebuilts.fetch(None, repo="owner/name", dest=tmp_path)
+    # a repo whose API is unreachable reports the actionable cause
+    assert "no release assets" in str(excinfo.value)
+
+
+def test_fetch_reports_an_empty_release(tmp_path: Path, monkeypatch) -> None:
+    from vscode_loong64 import utils
+
+    monkeypatch.setattr(utils, "http_get_json", lambda url, **kw: {"tag_name": "x", "assets": []})
+    with pytest.raises(Exception) as excinfo:
+        prebuilts.fetch(None, repo="owner/name", dest=tmp_path)
+    assert "upload" in str(excinfo.value)
+
+
+def test_fetch_picks_the_newest_bundle(tmp_path: Path, monkeypatch) -> None:
+    from vscode_loong64 import utils
+
+    assets = [
+        {"name": "loong64-prebuilts-1.147.0-electron43.6.0-loong64.tar.gz",
+         "browser_download_url": "https://example.invalid/old"},
+        {"name": "loong64-prebuilts-1.148.0-electron43.7.7-loong64.tar.gz",
+         "browser_download_url": "https://example.invalid/new"},
+        {"name": "notes.txt", "browser_download_url": "https://example.invalid/txt"},
+    ]
+    monkeypatch.setattr(
+        utils, "http_get_json", lambda url, **kw: {"tag_name": "t", "assets": assets}
+    )
+    downloaded = {}
+
+    def fake_download(url, dest, **kwargs):
+        downloaded["url"] = url
+        Path(dest).write_bytes(b"x")
+        return Path(dest)
+
+    monkeypatch.setattr(utils, "download", fake_download)
+    path = prebuilts.fetch(None, repo="owner/name", dest=tmp_path)
+    assert path.name.endswith("1.148.0-electron43.7.7-loong64.tar.gz")
+    assert downloaded["url"].endswith("/new")
