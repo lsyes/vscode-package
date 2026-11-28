@@ -123,9 +123,16 @@ def verify_static(path: Path, label: Optional[str] = None) -> None:
 
 
 def static_rust_env() -> Dict[str, str]:
-    """Environment that produces a fully static musl executable."""
+    """Environment that produces a fully static musl executable.
 
-    cc = str(shutil.which(MUSL_GCC) or MUSL_GCC)
+    The ``loongarch64-unknown-linux-musl`` target ships its own musl libc and
+    startup objects (``lib/rustlib/<target>/lib/self-contained``), so the host's
+    native C compiler is enough to drive the link; ``loongarch64-linux-musl-gcc``
+    is only preferred when it happens to be installed.
+    """
+
+    cross = shutil.which(MUSL_GCC)
+    cc = str(cross or shutil.which("gcc") or MUSL_GCC)
     flags = "-C target-feature=+crt-static -C relocation-model=pic -C code-model=medium"
     return {
         "CC_loongarch64_unknown_linux_musl": cc,

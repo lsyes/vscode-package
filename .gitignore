@@ -12,3 +12,6 @@ code_*.deb
 
 *.part
 *.tmp
+
+# portable payload bundles are build outputs
+loong64-prebuilts-*.tar.gz

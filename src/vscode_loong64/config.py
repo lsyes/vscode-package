@@ -72,13 +72,75 @@ NATIVE_MODULES: List[NativeModuleSpec] = [
     ),
 ]
 
-#: packages whose only architecture specific content is a prebuilt executable
+#: packages whose only architecture specific content is a prebuilt binary or a
+#: helper executable; they are handled by the helper/native sections below or
+#: removed in :data:`UNSUPPORTED_PREBUILTS`
 PREBUILT_MODULES: List[str] = [
     "@vscode/ripgrep-universal",
     "@microsoft/copilot-sdk-linux-x64",
     "@vscode/deviceid",
     "@vscode/vsce-sign",
+    "@vscode/sandbox-runtime",
 ]
+
+#: upstream source of the VS Code CLI / copilot shim, used to rebuild the
+#: architecture specific helpers that ship in ``bin/``.  A codeload tarball is
+#: fetched instead of a git checkout: only a few directories are needed and no
+#: credentials or full history are involved.
+VSCODE_SOURCE_TARBALL = "https://codeload.github.com/microsoft/vscode/tar.gz"
+#: directories of the repository the helper builds need
+VSCODE_SOURCE_PATHS = ("cli", "copilot_shim", "package.json", "product.json")
+
+#: standalone helpers that are not ``.node`` addons.  Each entry is rebuilt (or
+#: taken from the prebuilt cache) and installed into the staged tree.
+STANDALONE_HELPERS: Dict[str, Dict[str, str]] = {
+    "code-tunnel": {
+        "kind": "rust",
+        "crate": "cli",
+        "binary": "code",
+        "install": "bin/code-tunnel",
+        "description": "VS Code tunnel / serve-web / agent CLI (Rust)",
+    },
+    "copilot-shim": {
+        "kind": "rust",
+        "crate": "copilot_shim",
+        "binary": "copilot",
+        "install": "bin/copilot-shim/copilot",
+        "description": "GitHub Copilot CLI bootstrapper (Rust)",
+    },
+    "apply-seccomp": {
+        "kind": "seccomp",
+        "binary": "apply-seccomp",
+        "install": "resources/app/node_modules/@vscode/sandbox-runtime/vendor/seccomp/loong64/apply-seccomp",
+        "description": "seccomp BPF unix-socket filter for @vscode/sandbox-runtime (C)",
+    },
+    "vsce-sign": {
+        "kind": "dotnet",
+        "crate": "vsce-sign-cs",
+        "binary": "vsce-sign",
+        "install": "resources/app/node_modules.asar.unpacked/@vscode/vsce-sign/bin/vsce-sign",
+        "description": "extension signature verifier (.NET NativeAOT)",
+    },
+}
+
+#: prebuilt binaries that upstream never published for loongarch64.  They are
+#: removed from the staged tree on purpose; every other foreign binary in the
+#: payload is an error, so this list is the single place that can hide one.
+UNSUPPORTED_PREBUILTS: Dict[str, str] = {
+    "**/@microsoft/copilot-sdk-*/**/*.node": "GitHub Copilot SDK ships runtime.node for x64/arm64 only; the extension falls back to its TypeScript implementation",
+    "**/@github/copilot/**/prebuilds/**/*.node": "GitHub Copilot CLI ships cli-native.node/runtime.node for x64/arm64 only",
+    "**/@github/copilot/**/tgrep/**": "GitHub Copilot CLI ships tgrep for x64/arm64 only; ripgrep is substituted",
+    "**/microsoft-authentication/**/msal-node-runtime.node": "msal-node-runtime has prebuilds for win32/darwin/linux-x64 only; the extension falls back to the JS broker",
+    "**/microsoft-authentication/**/libmsalruntime.so": "same as msal-node-runtime.node",
+    "**/@vscode/deviceid/**/windows.node": "deviceid only ships a Windows binding; Linux uses dist/devdeviceid.js",
+    "**/ms-vscode.js-debug/**/*.win32-*.node": "Windows-only debugging helper shipped for win32",
+    "**/foundry-local-sdk/**/prebuilds/**": "foundry-local-sdk has no loongarch64 prebuild; the Copilot SDK feature is unavailable",
+    "**/@vscode/sandbox-runtime/vendor/seccomp/x64/**": "foreign seccomp helper; vendor/seccomp/loong64/apply-seccomp is built from the bundled sources instead",
+    "**/@vscode/sandbox-runtime/vendor/seccomp/arm64/**": "foreign seccomp helper; vendor/seccomp/loong64/apply-seccomp is built from the bundled sources instead",
+    "**/@teddyzhu/**/*.node": "vendored clipboard native module has no loongarch64 build",
+    "**/@picovoice/**/*.node": "vendored pvrecorder native module has no loongarch64 build",
+    "**/napi-oop-runtime/**/*.node": "vendored napi-oop-runtime has no loongarch64 build",
+}
 
 
 def _env_path(name: str, default: Path) -> Path:
@@ -185,6 +247,18 @@ class BuildConfig:
     os_proxy_features: str = OS_PROXY_RESOLVER_FEATURES
     #: skip the native module build entirely
     skip_natives: bool = False
+    #: rebuild the standalone helpers (code-tunnel, copilot shim, apply-seccomp,
+    #: vsce-sign) instead of keeping the upstream x64 binaries
+    rebuild_helpers: bool = True
+    #: extra directories searched for prebuilt helpers, in order
+    prebuilt_dirs: List[Path] = field(default_factory=list)
+    #: allow the builder to download a LoongArch .NET SDK for NativeAOT
+    dotnet_download: bool = True
+    #: portable archive with the architecture specific payloads of a previous
+    #: build (see :mod:`vscode_loong64.prebuilts`); skips every compile step
+    prebuilt_bundle: Optional[Path] = None
+    #: write such a bundle after a successful build
+    emit_prebuilt_bundle: bool = False
 
     @property
     def nproc(self) -> int:
@@ -216,8 +290,11 @@ class BuildConfig:
             "sourcePlatform": self.source_platform,
             "electronFallback": self.allow_electron_fallback,
             "rebuildNatives": self.rebuild_natives,
+            "rebuildHelpers": self.rebuild_helpers,
+            "prebuiltBundle": str(self.prebuilt_bundle) if self.prebuilt_bundle else None,
             "formats": self.formats,
             "paths": self.paths.describe() if self.paths else {},
+            "prebuiltDirs": [str(p) for p in self.prebuilt_dirs],
             "host": {
                 "system": platform.system(),
                 "machine": platform.machine(),

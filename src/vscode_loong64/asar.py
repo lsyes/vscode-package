@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -173,24 +174,60 @@ def list_native_packages(archive_path: Path) -> Dict[str, str]:
     return versions
 
 
+def _prune(node: Dict[str, object], prefix: str, removed: Iterable[str]) -> None:
+    """Drop ``removed`` members (and directories they leave empty) in place."""
+
+    removed = set(removed)
+    files = node.get("files") or {}
+    for name in list(files):
+        entry = files[name]
+        current = f"{prefix}/{name}" if prefix else name
+        if current in removed:
+            del files[name]
+            continue
+        if "files" in entry:
+            _prune(entry, current, removed)
+            if not (entry.get("files") or {}):
+                del files[name]
+
+
 def _header_pickle(header: Dict[str, object]) -> bytes:
+    """Serialise the asar header the way ``@electron/asar`` does.
+
+    The first four little-endian ``uint32`` values are::
+
+        4                      # pickle payload size marker
+        headerSize             # 8 + padded JSON length
+        pickledHeaderLen       # 4 + padded JSON length
+        jsonLength             # unpadded JSON length
+
+    followed by the JSON header padded to a 4-byte boundary.  ``data_offset``
+    is ``8 + headerSize`` (see :meth:`AsarArchive.open`).
+    """
+
     payload = json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    json_pickle = struct.pack("<I", len(payload)) + payload
-    return struct.pack("<II", 4, len(json_pickle)) + json_pickle
+    padded = payload + b"\x00" * ((-len(payload)) % 4)
+    header_size = 8 + len(padded)
+    pickled_len = 4 + len(padded)
+    return struct.pack("<IIII", 4, header_size, pickled_len, len(payload)) + padded
 
 
 def repack(
     source: Path,
     dest: Path,
     replacements: Optional[Dict[str, Path]] = None,
+    removals: Optional[Iterable[str]] = None,
 ) -> None:
     """Rewrite ``source`` into ``dest`` replacing/unpacking specific members.
 
     ``replacements`` maps archive member path -> file on disk.  Replaced members
     are written as *unpacked* entries, which is what VSCode expects for binaries.
+    ``removals`` drops members (and their now-empty parent directories) from
+    both the header and the data section.
     """
 
     replacements = {k.replace("\\", "/").lstrip("/"): Path(v) for k, v in (replacements or {}).items()}
+    removed = {r.replace("\\", "/").lstrip("/") for r in (removals or ())}
     src = AsarArchive.open(source)
     header = json.loads(json.dumps(src.header))  # deep copy
     nodes: Dict[str, Dict[str, object]] = {}
@@ -203,6 +240,10 @@ def repack(
                 index(entry, current)
 
     index(header)
+
+    if removed:
+        _prune(header, "", removed)
+        nodes = {k: v for k, v in nodes.items() if k not in removed}
 
     replacements = {k: v for k, v in replacements.items() if k in nodes}
     for member in replacements:
@@ -233,36 +274,53 @@ def repack(
         if entry.get("unpacked"):
             pass
 
-    new_header = _header_pickle(header)
-
-    # copy data: unpacked originals must be materialised, packed ones copied over
-    offsets: Dict[str, int] = {}
-    with open(src.path, "rb") as fh_in, open(dest, "wb") as fh_out:
-        fh_out.write(new_header)
-        cursor = 0
-        for entry in sorted(src.files.values(), key=lambda e: e.path):
-            if entry.path in replacements:
+    # Packed members are laid out in the data section in the same order as they
+    # are written.  Offsets are computed up front so the header can be written
+    # once: its JSON length depends on the offset values, which means it must not
+    # be streamed before the data (a longer header would misalign every offset).
+    packed: List[Tuple[AsarFile, Dict[str, object]]] = []
+    for entry in sorted(src.files.values(), key=lambda e: e.path):
+        if entry.path in replacements or entry.path in removed:
+            continue
+        node = nodes.get(entry.path)
+        if node is None:
+            continue
+        if entry.unpacked:
+            # Unpacked members keep ``size`` in the header (Electron uses it for
+            # directory listings) and have no ``offset``.  A zero size makes the
+            # loader report "Could not locate the bindings file", so the real
+            # size is restored from the extracted file when the header lost it.
+            source_unpacked = Path(str(src.path) + ".unpacked") / entry.path
+            node.pop("offset", None)
+            if not source_unpacked.exists():
+                # a staged build may already have pruned this binary
                 continue
-            node = nodes.get(entry.path)
-            if node is None:
-                continue
-            if entry.unpacked:
-                data = src.read(entry.path)
+            node["size"] = source_unpacked.stat().st_size
+            node["unpacked"] = True
+            if src.path.resolve() != dest.resolve():
                 target = unpacked_root / entry.path
                 if not target.exists():
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(data)
-                    target.chmod(0o755 if entry.executable else 0o644)
-                node.pop("offset", None)
-                node.pop("size", None)
-                continue
+                    shutil.copy2(source_unpacked, target)
+            continue
+        packed.append((entry, node))
+
+    cursor = 0
+    for entry, node in packed:
+        node["offset"] = str(cursor)
+        node["size"] = entry.size
+        cursor += entry.size
+    new_header = _header_pickle(header)
+    with open(src.path, "rb") as fh_in, open(dest, "wb") as fh_out:
+        fh_out.write(new_header)
+        written = 0
+        for entry, _node in packed:
             fh_in.seek(src.data_offset + entry.offset)
             payload = fh_in.read(entry.size)
             fh_out.write(payload)
-            node["offset"] = str(cursor)
-            node["size"] = len(payload)
-            cursor += len(payload)
-        # rewrite header now that offsets are known
-        fh_out.seek(0)
-        fh_out.write(_header_pickle(header))
+            written += len(payload)
+        if written != cursor:  # pragma: no cover - corrupt archive
+            raise BuildError(
+                f"asar repack wrote {written} bytes but the header describes {cursor}"
+            )
     dest.chmod(0o644)

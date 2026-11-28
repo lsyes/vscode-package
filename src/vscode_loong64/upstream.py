@@ -47,6 +47,8 @@ class ReleaseInfo:
     product_version: Optional[str] = None
     url: Optional[str] = None
     sha256: Optional[str] = None
+    #: SHA-1 of the installer (``hash`` in the update API); *not* the commit
+    sha1: Optional[str] = None
     notes: Optional[str] = None
     raw: Dict[str, object] = field(default_factory=dict)
 
@@ -69,6 +71,7 @@ class ReleaseInfo:
             "productVersion": self.product_version,
             "url": self.url,
             "sha256": self.sha256,
+            "sha1": self.sha1,
             "tag": self.tag,
         }
 
@@ -83,6 +86,7 @@ class ReleaseInfo:
             product_version=data.get("productVersion"),  # type: ignore[arg-type]
             url=data.get("url"),  # type: ignore[arg-type]
             sha256=data.get("sha256"),  # type: ignore[arg-type]
+            sha1=data.get("sha1"),  # type: ignore[arg-type]
             notes=data.get("notes"),  # type: ignore[arg-type]
         )
 
@@ -94,38 +98,45 @@ def latest_release(platform: str = "linux-x64", quality: str = "stable") -> Rele
     data = utils.http_get_json(url)
     if not isinstance(data, dict) or "version" not in data:
         raise BuildError(f"unexpected payload from {url}: {str(data)[:200]}")
-    # In the "latest" payload ``version`` holds the commit hash while ``name`` and
-    # ``productVersion`` hold the marketing version.
+    # ``version`` is the source commit; ``hash`` is the SHA-1 of the installer
+    # and must never be used as the commit.
     return ReleaseInfo(
         version=str(data.get("productVersion") or data.get("name") or ""),
-        commit=str(data.get("hash") or data.get("version") or ""),
+        commit=str(data.get("version") or ""),
         quality=quality,
         platform=platform,
         timestamp=int(data.get("timestamp") or 0),
         product_version=data.get("productVersion"),  # type: ignore[arg-type]
         url=data.get("url"),  # type: ignore[arg-type]
         sha256=data.get("sha256hash"),  # type: ignore[arg-type]
+        sha1=str(data.get("hash") or "") or None,
         notes=data.get("notes"),  # type: ignore[arg-type]
         raw=data,
     )
 
 
 def specific_release(version: str, platform: str = "linux-x64", quality: str = "stable") -> ReleaseInfo:
-    """Return metadata for an explicitly requested version."""
+    """Return metadata for an explicitly requested version.
 
-    url = f"{UPDATE_BASE}/update/{platform}/{quality}/{version}"
+    The endpoint is ``/api/versions/<version>/<platform>/<quality>``.  The older
+    ``/api/update/<platform>/<quality>/<version>`` shape takes a *commit* in its
+    last segment, so passing a marketing version there always returns 404.
+    """
+
+    url = f"{UPDATE_BASE}/versions/{version}/{platform}/{quality}"
     data = utils.http_get_json(url)
     if not isinstance(data, dict) or "url" not in data:
         raise BuildError(f"version {version} is not available for {platform}/{quality}")
     info = ReleaseInfo(
         version=str(data.get("productVersion") or version),
-        commit=str(data.get("hash") or ""),
+        commit=str(data.get("version") or ""),
         quality=quality,
         platform=platform,
         timestamp=int(data.get("timestamp") or 0),
         product_version=data.get("productVersion"),  # type: ignore[arg-type]
         url=data.get("url"),  # type: ignore[arg-type]
         sha256=data.get("sha256hash"),  # type: ignore[arg-type]
+        sha1=str(data.get("hash") or "") or None,
         notes=data.get("notes"),  # type: ignore[arg-type]
         raw=data,
     )
@@ -155,7 +166,12 @@ def resolve_version(
 
 
 def download_url_for(version: str, platform: str = "linux-x64", package: str = "tar.gz", quality: str = "stable") -> str:
-    """Build a direct download URL (used when the API cannot be reached)."""
+    """Build a direct download URL (used when the API cannot be reached).
+
+    This endpoint redirects to the current installer for ``version`` and also
+    accepts a commit in place of the marketing version, so it keeps working when
+    the metadata API is down.
+    """
 
     return f"https://update.code.visualstudio.com/{version}/{platform}/{quality}?packageType={package}"
 
@@ -205,6 +221,42 @@ def should_build(
         if candidate in normalised:
             return False
     return True
+
+
+def latest_or_none(platform: str = "linux-x64", quality: str = "stable") -> Optional[ReleaseInfo]:
+    """Like :func:`latest_release` but returns ``None`` instead of raising.
+
+    Used by the pipeline to report "upstream moved ahead" without turning a
+    transient API outage into a failed build.
+    """
+
+    try:
+        return latest_release(platform=platform, quality=quality)
+    except BuildError as exc:
+        warn("unable to query the newest upstream release: %s", exc)
+        return None
+
+
+def change_report(current: str, latest: Optional[str], quality: str = "stable") -> Dict[str, object]:
+    """Describe whether ``current`` is behind ``latest`` and which tag sources use."""
+
+    report: Dict[str, object] = {
+        "current": current,
+        "latest": latest,
+        "quality": quality,
+        "currentTag": None,
+        "latestTag": None,
+        "update": False,
+    }
+    if current and current not in ("", "latest", "0.0.0"):
+        report["currentTag"] = current
+    if latest:
+        report["latestTag"] = latest
+    if not current or current in ("", "latest"):
+        report["update"] = bool(latest)
+    elif latest:
+        report["update"] = compare_versions(latest, current) > 0
+    return report
 
 
 def load_state(path: Path) -> Dict[str, object]:

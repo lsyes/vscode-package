@@ -316,7 +316,16 @@ def _patch_package_json(stage: Stage) -> None:
 
 
 def patch_product(stage: Stage) -> None:
-    """Adjust ``product.json`` so the build does not advertise x64 updates."""
+    """Adjust ``product.json`` so the build does not advertise x64 updates.
+
+    ``chat.copilotCliCommand.enabled`` defaults to ``true`` upstream, which makes
+    VS Code advertise a "Copilot CLI" terminal profile that starts
+    ``bin/copilot-shim/copilot``.  The helper itself is rebuilt for loongarch64,
+    but the CLI it bootstraps is published for x64/arm64 only, so that profile
+    can only ever answer "GitHub Copilot CLI was not found".  ``IProductConfiguration``
+    has no ``configurationDefaults`` member, so the default is flipped inside the
+    bundled workbench instead (see :func:`_disable_copilot_cli_defaults`).
+    """
 
     product_path = stage.app_dir / "product.json"
     if not product_path.exists():
@@ -328,6 +337,55 @@ def patch_product(stage: Stage) -> None:
         product["quality"] = stage.config.quality
     product["loong64Build"] = True
     product_path.write_text(json.dumps(product, indent="\t", ensure_ascii=False) + "\n", encoding="utf-8")
+
+    _disable_copilot_cli_defaults(stage)
+
+
+#: files that register ``chat.copilotCliCommand.enabled`` with ``default: true``
+COPILOT_CLI_SETTING = '"chat.copilotCliCommand.enabled":'
+_COPILOT_CLI_DEFAULT_RE = re.compile(
+    r'("chat\.copilotCliCommand\.enabled":\{[^{}]*?default:)!0'
+)
+
+
+def _disable_copilot_cli_defaults(stage: Stage) -> List[Path]:
+    """Flip the built-in default of ``chat.copilotCliCommand.enabled`` to false.
+
+    Upstream registers the setting with ``default: true``.  The Copilot CLI
+    terminal integration then adds a "Copilot CLI" profile that launches
+    ``bin/copilot-shim/copilot`` whenever the setting is not ``false``:
+
+    .. code-block:: javascript
+
+        let n = this.configurationService.getNonExtensionConfig(
+            "chat.copilotCliCommand.enabled") !== false;
+
+    ``IProductConfiguration`` has no ``configurationDefaults`` member (a
+    product-level default is never registered), so the bundled literal is the
+    only place where the default can be changed.  Both workbench bundles are
+    patched in place; a build that cannot find the literal records a warning so
+    the regression is visible in the manifest.
+    """
+
+    changed: List[Path] = []
+    app_dir = stage.app_dir
+    for bundle in ("workbench.desktop.main.js", "sessions.desktop.main.js"):
+        for path in app_dir.glob(f"out/**/{bundle}"):
+            text = path.read_text(encoding="utf-8", errors="replace")
+            if COPILOT_CLI_SETTING not in text:
+                continue
+            patched, count = _COPILOT_CLI_DEFAULT_RE.subn(r"\1!1", text, count=1)
+            if count == 0:
+                stage.warn(
+                    "could not change the default of chat.copilotCliCommand.enabled in %s",
+                    path.relative_to(app_dir),
+                )
+                continue
+            path.write_text(patched, encoding="utf-8")
+            changed.append(path)
+            log("disabled the Copilot CLI terminal profile default in %s", path.name)
+    stage.native_report["copilotCliDefault"] = [str(p.relative_to(app_dir)) for p in changed]
+    return changed
 
 
 # --------------------------------------------------------------------------------------
@@ -542,7 +600,7 @@ def disable_unloadable_natives(stage: Stage) -> List[str]:
         if candidate.exists():
             candidate.unlink()
     candidates: List[Path] = []
-    for base in (app_dir / "node_modules.asar.unpacked", app_dir / "node_modules"):
+    for base in native_scan_roots(app_dir):
         if base.is_dir():
             candidates.extend(base.rglob("*.node"))
     for path in candidates:
@@ -560,13 +618,56 @@ def disable_unloadable_natives(stage: Stage) -> List[str]:
     return disabled
 
 
+#: directories that may hold native payloads.  ``resources/app/node_modules``
+#: used to be missing here, which is how ``apply-seccomp`` and ``vsce-sign``
+#: slipped into a release unexamined.
+NATIVE_SCAN_DIRS = (
+    "node_modules.asar.unpacked",
+    "node_modules",
+    "extensions",
+)
+
+
+def native_scan_roots(app_dir: Path) -> List[Path]:
+    """Every directory below ``app/`` that can contain native payloads."""
+
+    return [app_dir / name for name in NATIVE_SCAN_DIRS]
+
+
+#: names of executables that are helpers rather than Node addons.  ``.node`` and
+#: ``.so`` are covered by the suffix check; these are the extensionless ones.
+HELPER_NAMES = frozenset(
+    {
+        "rg",
+        "tgrep",
+        "apply-seccomp",
+        "vsce-sign",
+        "copilot-runtime",
+        "code-tunnel",
+        "copilot",
+        "srt",
+        "bwrap",
+    }
+)
+
+
+def is_native_payload(path: Path) -> bool:
+    """Whether ``path`` is something the loader (or a shell) would execute."""
+
+    if path.suffix in (".node", ".so"):
+        return True
+    if path.name in HELPER_NAMES:
+        return True
+    return ".so." in path.name
+
+
 def disable_foreign_helpers(stage: Stage, replacements: Sequence[Path] = ()) -> List[str]:
     """Disable prebuilt ELF helpers that remain foreign to the target."""
 
     disabled: List[str] = []
     app_dir = stage.app_dir
     replaced = {path.resolve() for path in replacements}
-    for base in (app_dir / "node_modules.asar.unpacked", app_dir / "extensions"):
+    for base in native_scan_roots(app_dir):
         if not base.is_dir():
             continue
         for path in base.rglob("*"):
@@ -574,7 +675,7 @@ def disable_foreign_helpers(stage: Stage, replacements: Sequence[Path] = ()) -> 
                 continue
             if path.resolve() in replaced:
                 continue
-            if path.name in ("rg", "tgrep") or path.suffix in (".node", ".so"):
+            if is_native_payload(path):
                 machine = elf_machine(path)
                 if machine is None or machine == EM_LOONGARCH:
                     continue
@@ -589,38 +690,101 @@ def disable_foreign_helpers(stage: Stage, replacements: Sequence[Path] = ()) -> 
     return disabled
 
 
-def disable_unsupported_copilot(stage: Stage) -> List[str]:
-    """Hide Copilot SDK binaries for architectures it has no LoongArch build for.
+def prune_asar_payloads(stage: Stage) -> Dict[str, object]:
+    """Drop native members from ``node_modules.asar`` that cannot work here.
 
-    The extension is not usable with an x86-64 runtime.node.  Hide the
-    platform-specific package so VS Code falls back to the TS implementation.
+    ``@vscode/sandbox-runtime`` ships its x64/arm64 ``apply-seccomp`` *packed*
+    inside the asar (only ``.node`` and a few large files are unpacked), so a
+    foreign-helper sweep over the file system never sees it.  The same applies
+    to every unpacked member whose file was removed while staging
+    (``@microsoft/copilot-sdk-linux-x64`` and friends): the header would keep
+    pointing at a file that is not in the package any more.
+
+    The archive is rewritten in place when - and only when - something has to
+    go.
     """
 
-    disabled: List[str] = []
-    app_dir = stage.app_dir
-    for candidate in app_dir.rglob("runtime.node.x86_64.disabled"):
-        candidate.unlink()
-    for candidate in app_dir.rglob("runtime.node.foreign.disabled"):
-        candidate.unlink()
-    for candidate in app_dir.rglob("*copilot-sdk*.unsupported"):
-        if candidate.is_dir():
-            shutil.rmtree(candidate)
-    for candidate in app_dir.rglob("runtime.node.x86_64.disabled"):
-        candidate.unlink()
-    for candidate in app_dir.rglob("runtime.node.foreign.disabled"):
-        candidate.unlink()
-    for base in (app_dir / "node_modules.asar.unpacked", app_dir / "node_modules", app_dir / "extensions"):
-        if not base.is_dir():
+    asar_path = stage.app_dir / "node_modules.asar"
+    if not asar_path.exists():
+        return {"status": "absent"}
+    archive = asar.AsarArchive.open(asar_path)
+    unpacked_root = Path(str(asar_path) + ".unpacked")
+    removals: List[str] = []
+    for entry in archive.files.values():
+        if not is_native_payload(Path(entry.path)):
             continue
-        for package in list(base.rglob("@microsoft/copilot-sdk-*")) + list(base.rglob("@github/copilot-sdk-*")):
-            if not package.is_dir():
+        if entry.unpacked:
+            on_disk = unpacked_root / entry.path
+            if not on_disk.exists() or not is_loongarch_elf(on_disk):
+                removals.append(entry.path)
+            continue
+        removals.append(entry.path)
+    if not removals:
+        return {"status": "unchanged", "removed": []}
+
+    scratch = asar_path.with_suffix(".asar.tmp")
+    asar.repack(asar_path, scratch, removals=removals)
+    # ``repack`` may have materialised unpacked payloads next to the scratch
+    # file; move the archive into place and keep the unpacked tree as it is.
+    scratch.replace(asar_path)
+    scratch_unpacked = Path(str(scratch) + ".unpacked")
+    if scratch_unpacked.exists():
+        shutil.rmtree(scratch_unpacked, ignore_errors=True)
+    for member in removals:
+        stale = unpacked_root / member
+        if stale.exists() and not is_loongarch_elf(stale):
+            stale.unlink()
+    stage.native_report["asarRemoved"] = removals
+    warn("removed %d native payload(s) from node_modules.asar", len(removals))
+    return {"status": "pruned", "removed": removals}
+
+
+def prune_unsupported_prebuilts(stage: Stage) -> List[Dict[str, object]]:
+    """Remove every native payload upstream never published for LoongArch.
+
+    The previous implementation hid whatever was left over after the rebuild
+    pass, which meant a mis-specified module silently became a
+    ``*.x86_64.disabled`` file inside the package.  The allowed exceptions are
+    now an explicit list (:data:`config.UNSUPPORTED_PREBUILTS`); anything else
+    that is still foreign is reported by :func:`disable_foreign_helpers` *and*
+    fails :func:`verify_layout`.
+    """
+
+    from .config import UNSUPPORTED_PREBUILTS
+
+    app_dir = stage.app_dir
+    removed: List[Dict[str, object]] = []
+    for pattern, reason in UNSUPPORTED_PREBUILTS.items():
+        for path in sorted(app_dir.glob(pattern)):
+            if not path.exists():
                 continue
-            shutil.rmtree(package)
-            disabled.append(str(package.relative_to(app_dir)))
-    if disabled:
-        stage.native_report.setdefault("unsupported", []).extend(disabled)
-        warn("disabled Copilot SDK runtime for unsupported architecture")
-    return disabled
+            relative = str(path.relative_to(app_dir))
+            if any(str(entry["path"]) == relative for entry in removed):
+                continue
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+            removed.append({"path": relative, "reason": reason})
+            log("removed unsupported prebuilt %s", relative)
+    # Leftovers from earlier revisions of the builder must not survive either.
+    for suffix in (".x86_64.disabled", ".foreign.disabled", ".unsupported"):
+        for path in app_dir.rglob(f"*{suffix}"):
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+    if removed:
+        stage.native_report["unsupported"] = removed
+        warn("removed %d prebuilt payload(s) without a LoongArch build", len(removed))
+    return removed
+
+
+def disable_unsupported_copilot(stage: Stage) -> List[str]:
+    """Backwards compatible alias for :func:`prune_unsupported_prebuilts`."""
+
+    removed = prune_unsupported_prebuilts(stage)
+    return [str(entry["path"]) for entry in removed]
 
 
 def replace_ripgrep(stage: Stage, binary: Optional[Path]) -> List[Path]:
@@ -779,23 +943,76 @@ def verify_layout(stage: Stage) -> List[Check]:
         )
     rg_binaries = [
         path
-        for base in (app_dir / "node_modules.asar.unpacked", app_dir / "extensions")
+        for base in native_scan_roots(app_dir)
         if base.is_dir()
         for path in base.rglob("rg")
         if path.is_file()
     ]
     bad_rg = [path for path in rg_binaries if musltoolchain.static_problems(path)]
     checks.append(Check("ripgrep binaries are static", bool(rg_binaries) and not bad_rg, str(len(rg_binaries)) + " binaries"))
+
+    # -- standalone helpers ------------------------------------------------------
+    from .config import STANDALONE_HELPERS
+
+    helper_failures: List[str] = []
+    for name, spec in STANDALONE_HELPERS.items():
+        target = stage.root / str(spec["install"])
+        if not target.exists():
+            helper_failures.append(f"{name}: missing")
+            continue
+        if not is_loongarch_elf(target):
+            helper_failures.append(f"{name}: {arch_label(target)}")
+            continue
+        if spec["kind"] in ("rust", "seccomp", "dotnet"):
+            problems = musltoolchain.static_problems(target) if spec["kind"] == "seccomp" else []
+            if problems:
+                helper_failures.append(f"{name}: not static ({'; '.join(problems)})")
+    checks.append(
+        Check(
+            "standalone helpers are loongarch64",
+            not helper_failures,
+            ", ".join(helper_failures) or f"{len(STANDALONE_HELPERS)} helpers",
+        )
+    )
+
+    # -- foreign payloads -------------------------------------------------------
     foreign = []
-    for base in (app_dir / "node_modules.asar.unpacked", app_dir / "extensions"):
+    for base in native_scan_roots(app_dir):
         if not base.is_dir():
             continue
         for path in base.rglob("*"):
             if not path.is_file() or path.is_symlink():
                 continue
-            if path.name in ("rg", "tgrep") or path.suffix in (".node", ".so"):
+            if is_native_payload(path):
                 machine = elf_machine(path)
                 if machine is not None and machine != EM_LOONGARCH:
                     foreign.append(str(path.relative_to(app_dir)))
+    for base in (stage.root / "bin",):
+        if base.is_dir():
+            for path in base.rglob("*"):
+                if path.is_file() and not path.is_symlink():
+                    machine = elf_machine(path)
+                    if machine is not None and machine != EM_LOONGARCH:
+                        foreign.append(str(path.relative_to(stage.root)))
     checks.append(Check("no foreign native payloads", not foreign, ", ".join(foreign[:5])))
+
+    # -- the asar must not carry native payloads either -------------------------
+    asar_path = app_dir / "node_modules.asar"
+    if asar_path.exists():
+        try:
+            archive = asar.AsarArchive.open(asar_path)
+            packed_native = [
+                entry.path
+                for entry in archive.files.values()
+                if not entry.unpacked and is_native_payload(Path(entry.path))
+            ]
+            checks.append(
+                Check(
+                    "node_modules.asar has no packed native payloads",
+                    not packed_native,
+                    ", ".join(packed_native[:5]) or "all native payloads are unpacked",
+                )
+            )
+        except (BuildError, ValueError) as exc:  # pragma: no cover - corrupt asar
+            checks.append(Check("node_modules.asar is readable", False, str(exc)))
     return checks

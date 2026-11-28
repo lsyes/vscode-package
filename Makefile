@@ -12,11 +12,14 @@ UPSTREAM_DIR ?=
 ELECTRON_ARCHIVE ?=
 RIPGREP ?=
 OS_PROXY_SRC ?=
+PREBUILT ?=
+PREBUILT_BUNDLE ?=
+PREBUILT_ARGS ?=
 EXTRA_ARGS ?=
 
 export PYTHONPATH := $(ROOT)/src$(if $(PYTHONPATH),:$(PYTHONPATH))
 
-.PHONY: help bootstrap check test build package deb publish clean
+.PHONY: help bootstrap check test build package deb bundle deb-from-bundle publish clean
 
 help:
 	@printf '%s\n' \
@@ -26,6 +29,18 @@ help:
 	  'make deb [VERSION=1.148.0]             build only the Debian package' \
 	  'make package STAGE=work/build/stage VERSION=1.148.0' \
 	  'make publish                           upload dist/manifest.json artifacts with gh' \
+	  ''\
+	  'helper options (pass to build/deb):' \
+	  '  PREBUILT=/srv/prebuilts               reuse prebuilt helpers from a directory' \
+	  '  PREBUILT_ARGS=--no-prebuilt           compile every helper from source' \
+	  '  PREBUILT_ARGS=--no-helpers            keep the upstream x64 helpers (broken)' \
+	  '  PREBUILT_ARGS=--no-dotnet-download    never download the LoongArch .NET SDK' \
+	  '  PREBUILT_BUNDLE=dist/loong64-prebuilts-*.tar.gz' \
+	  '                                        build on x64 from a bundle (no compilers)' \
+	  ''\
+	  'prebuilt bundles (for runners without a LoongArch CPU):' \
+	  '  make bundle VERSION=1.148.0           emit the bundle on a LoongArch host' \
+	  '  make deb-from-bundle BUNDLE=...       package on any x86-64 runner' \
 	  'make clean                             remove work/, dist/ and test caches'
 
 bootstrap:
@@ -46,10 +61,20 @@ build:
 	  $(if $(ELECTRON_ARCHIVE),--electron-archive "$(ELECTRON_ARCHIVE)",) \
 	  $(if $(RIPGREP),--ripgrep "$(RIPGREP)",) \
 	  $(if $(OS_PROXY_SRC),--os-proxy-src "$(OS_PROXY_SRC)",) \
+	  $(if $(PREBUILT),--prebuilt "$(PREBUILT)",) \
+	  $(if $(PREBUILT_BUNDLE),--prebuilt-bundle "$(PREBUILT_BUNDLE)",) \
+	  $(PREBUILT_ARGS) \
 	  $(EXTRA_ARGS)
 
 deb:
 	$(MAKE) build VERSION="$(VERSION)" FORMATS=deb
+
+bundle:
+	$(MAKE) build VERSION="$(VERSION)" FORMATS=deb PREBUILT_ARGS=--emit-prebuilt-bundle
+
+deb-from-bundle:
+	@test -n "$(BUNDLE)" || (echo 'BUNDLE is required (dist/loong64-prebuilts-*.tar.gz)' >&2; exit 2)
+	$(MAKE) deb VERSION="$(VERSION)" PREBUILT_BUNDLE="$(BUNDLE)"
 
 package:
 	@test -n "$(STAGE)" || (echo 'STAGE is required' >&2; exit 2)

@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from . import artifacts, electron, pack, upstream, utils
+from . import artifacts, dotnet, electron, helpers, pack, prebuilts, seccomp, upstream, utils
 from .config import BuildConfig, is_loong64_host
 from .natives import NativeBuild, NativeBuilder
 from .config import NATIVE_MODULES as config_native_specs
@@ -42,6 +42,9 @@ class BuildResult:
     manifest_path: Optional[Path] = None
     timings: Dict[str, float] = field(default_factory=dict)
     checks: List[Dict[str, object]] = field(default_factory=list)
+    change_report: Dict[str, object] = field(default_factory=dict)
+    helper_results: Dict[str, object] = field(default_factory=dict)
+    bundle: Optional[Path] = None
 
     def manifest(self) -> Dict[str, object]:
         stage = self.stage
@@ -65,6 +68,7 @@ class BuildResult:
                 "sourcePlatform": self.config.source_platform,
                 "formats": self.config.formats,
                 "rebuildNatives": self.config.rebuild_natives,
+                "rebuildHelpers": self.config.rebuild_helpers,
                 "binaryName": self.config.binary_name,
                 "staticRust": self.config.static_rust,
                 "cxxAddons": "loongarch64-gnu",
@@ -74,11 +78,24 @@ class BuildResult:
                 },
             },
             "artifacts": [a.as_dict() for a in self.artifacts],
+            "prebuiltBundle": str(self.bundle) if self.bundle else None,
+            "prebuiltBundleInput": (
+                str(self.config.prebuilt_bundle) if self.config.prebuilt_bundle else None
+            ),
+            "upstreamChange": getattr(self, "change_report", {}),
+            "helperBuilds": self._helper_report(),
             "nativeModules": stage.native_report if stage else {},
             "checks": self.checks,
             "warnings": stage.warnings if stage else [],
             "timings": {k: round(v, 2) for k, v in self.timings.items()},
         }
+
+    def _helper_report(self) -> List[Dict[str, object]]:
+        return [
+            result.as_dict()
+            for result in self.helper_results.values()
+            if hasattr(result, "as_dict")
+        ]
 
     def write_manifest(self, path: Optional[Path] = None) -> Path:
         target = path or (self.config.paths.dist / "manifest.json")
@@ -97,6 +114,8 @@ class Pipeline:
         self.config = config
         self.paths = config.paths
         self.result: Optional[BuildResult] = None
+        self.change_report: Dict[str, object] = {}
+        self.bundle = None
         self._started = time.time()
 
     # -- helpers -----------------------------------------------------------------
@@ -164,6 +183,34 @@ class Pipeline:
             release.version = release.product_version
         self._phase("resolve", started)
         return release
+
+    def check_upstream(self, release: upstream.ReleaseInfo) -> Dict[str, object]:
+        """Record whether the payload is the newest upstream release.
+
+        The helper sources are keyed by the *payload* version, so an upstream
+        update automatically re-fetches ``cli/`` and ``copilot_shim/`` instead of
+        rebuilding against stale sources.  This method only reports the delta;
+        the actual resolution happens in :class:`helpers.HelperBuilder`.
+        """
+
+        latest = None
+        if not self.config.offline:
+            latest = upstream.latest_or_none(
+                platform=self.config.source_platform, quality=self.config.quality
+            )
+        latest_version = latest.version if latest else None
+        report = helpers.check_source_update(release.version, latest_version, self.config.quality)
+        report["sourcesCached"] = (self.paths.cache / "sources" / f"vscode-{release.version}").exists()
+        if report.get("update"):
+            log(
+                "upstream moved to %s (payload is %s): the helper sources will be re-fetched",
+                latest_version,
+                release.version,
+            )
+        elif latest_version:
+            log("payload %s is the newest upstream release", release.version)
+        self.change_report = report
+        return report
 
     def download(self, release: upstream.ReleaseInfo) -> Path:
         section("Downloading upstream sources")
@@ -261,9 +308,39 @@ class Pipeline:
                 return pack.load_payload(directory)
         return pack.load_payload(target)
 
+    def load_bundle(self, payload: pack.UpstreamPayload, runtime: electron.ElectronRuntime):
+        """Unpack ``--prebuilt-bundle`` and seed the helper cache from it."""
+
+        button = self.config.prebuilt_bundle
+        if not button:
+            return None
+        section("Loading prebuilt payload bundle")
+        started = time.time()
+        bundle = prebuilts.unpack(
+            Path(button),
+            self.paths.work / "bundle-current",
+        )
+        prebuilts.check_compatible(bundle, payload.version, runtime.version)
+        prebuilts.install_helpers(self.config, bundle, payload.version)
+        self.bundle = bundle
+        self._phase("bundle", started)
+        return bundle
+
     def build_natives(self, payload: pack.UpstreamPayload, runtime: electron.ElectronRuntime) -> Dict[str, Path]:
         section("Building native modules")
         started = time.time()
+        bundle = getattr(self, "bundle", None)
+        if bundle is not None:
+            artifacts_map = bundle.native_artifacts()
+            if bundle.ripgrep is not None:
+                artifacts_map["ripgrep"] = bundle.ripgrep
+            log(
+                "using %d prebuilt addon(s) and %s from the bundle",
+                len(bundle.natives),
+                "ripgrep" if bundle.ripgrep else "no ripgrep",
+            )
+            self._phase("natives", started)
+            return artifacts_map
         if not self.config.rebuild_natives:
             log("native rebuild disabled (--no-natives), keeping upstream binaries")
             self._phase("natives", started)
@@ -283,6 +360,33 @@ class Pipeline:
         result = builder.artifacts()
         result["ripgrep"] = builder.build_ripgrep()
         return result
+
+    def build_helpers(self, payload: pack.UpstreamPayload) -> Dict[str, Path]:
+        """Build the standalone helpers (tunnel CLI, copilot shim, ...)."""
+
+        section("Building standalone helpers")
+        started = time.time()
+        bundle = getattr(self, "bundle", None)
+        if bundle is not None:
+            log("using %d prebuilt helper(s) from the bundle", len(bundle.helpers))
+            self._phase("helpers", started)
+            return dict(bundle.helpers)
+        if not self.config.rebuild_helpers:
+            warn("helper rebuild disabled: bin/code-tunnel and bin/copilot-shim stay x86-64")
+            self._phase("helpers", started)
+            return {}
+        builder = helpers.HelperBuilder(
+            config=self.config,
+            version=payload.version,
+            quality=self.config.quality,
+        )
+        # ``apply-seccomp`` is compiled from sources shipped inside the payload,
+        # so it needs the extracted app directory rather than the checkout.
+        builder.build_all(payload.app_dir)
+        if self.result is not None:
+            self.result.helper_results = dict(builder.results)
+        self._phase("helpers", started)
+        return builder.artifacts()
 
     def _reuse_native_builds(self, builder: NativeBuilder) -> Dict[str, object]:
         """Reuse addons that are already compiled for this Electron/runtime."""
@@ -307,6 +411,7 @@ class Pipeline:
         payload: pack.UpstreamPayload,
         runtime: electron.ElectronRuntime,
         native_artifacts: Dict[str, Path],
+        helper_artifacts: Optional[Dict[str, Path]] = None,
     ) -> pack.Stage:
         section("Assembling LoongArch64 application")
         started = time.time()
@@ -317,8 +422,13 @@ class Pipeline:
         pack.install_natives(stage, native_artifacts, strict=self.config.rebuild_natives)
         pack.disable_unloadable_natives(stage)
         replaced = pack.replace_ripgrep(stage, native_artifacts.get("ripgrep"))
+        # Drop the payloads upstream never built for LoongArch *before* the
+        # foreign-helper sweep so the sweep only reports real mistakes.
+        pack.prune_unsupported_prebuilts(stage)
+        helpers.install(stage, helper_artifacts or {})
+        # the asar keeps its own copy of the seccomp helper packed inside it
+        pack.prune_asar_payloads(stage)
         pack.disable_foreign_helpers(stage, replaced)
-        pack.disable_unsupported_copilot(stage)
         pack.patch_product(stage)
         self._phase("stage", started)
         return stage
@@ -409,12 +519,25 @@ class Pipeline:
             product_version=payload.version,
             url=release.url,
             sha256=release.sha256,
+            sha1=release.sha1,
         )
         log("payload: %s", payload.describe())
+        self.result.change_report = self.check_upstream(self.result.release)
         runtime = self.resolve_electron(payload)
+        self.load_bundle(payload, runtime)
         native_artifacts = self.build_natives(payload, runtime)
-        stage = self.assemble(payload, runtime, native_artifacts)
+        helper_artifacts = self.build_helpers(payload)
+        stage = self.assemble(payload, runtime, native_artifacts, helper_artifacts)
         self.result.stage = stage
+        if self.config.emit_prebuilt_bundle:
+            self.result.bundle = prebuilts.pack(
+                self.config,
+                version=self.result.release.version,
+                electron=runtime.version,
+                helper_artifacts=helper_artifacts,
+                native_artifacts=native_artifacts,
+                commit=self.result.release.commit,
+            )
         self.result.checks = self.verify(stage, run_app=verify_app)
         # artifact names carry the real upstream version, not the selector
         if self.result.release.version and self.result.release.version != "latest":

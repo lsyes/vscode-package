@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net11.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>vsce-sign</AssemblyName>
+    <RootNamespace>VsceSign</RootNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <PublishAot>true</PublishAot>
+    <StripSymbols>true</StripSymbols>
+    <UseSystemResourceKeys>true</UseSystemResourceKeys>
+    <TieredCompilation>false</TieredCompilation>
+    <TrimmerSingleWarn>false</TrimmerSingleWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Trust anchors extracted from the Microsoft vsce-sign 2.0.8 binary. -->
+    <EmbeddedResource Include="Resources/trusted-roots.pem" />
+    <EmbeddedResource Include="Resources/publisher-certs.pem" />
+  </ItemGroup>
+
+</Project>

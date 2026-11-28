@@ -74,6 +74,36 @@ def build_parser() -> argparse.ArgumentParser:
     build_cmd.add_argument("--os-proxy-src", type=Path, default=None, help="checkout of microsoft/os-proxy-resolver")
     build_cmd.add_argument("--os-proxy-features", default="pac-engine", help="PAC backend feature for the proxy addon (pac-engine or wasm2c)")
     build_cmd.add_argument("--no-natives", action="store_true", help="do not rebuild native modules")
+    build_cmd.add_argument("--no-helpers", action="store_true", help="do not rebuild bin/code-tunnel, the copilot shim, apply-seccomp or vsce-sign")
+    build_cmd.add_argument(
+        "--prebuilt",
+        type=Path,
+        action="append",
+        default=None,
+        help="directory with prebuilt helpers (repeatable, searched before compiling)",
+    )
+    build_cmd.add_argument(
+        "--no-prebuilt",
+        action="store_true",
+        help="ignore the prebuilt cache and compile every helper from source",
+    )
+    build_cmd.add_argument(
+        "--no-dotnet-download",
+        action="store_true",
+        help="never download the LoongArch .NET SDK (vsce-sign then stays x64)",
+    )
+    build_cmd.add_argument(
+        "--prebuilt-bundle",
+        type=Path,
+        default=None,
+        help="tarball with the LoongArch addons/helpers of a previous build "
+        "(skips every compile step, for x64 runners)",
+    )
+    build_cmd.add_argument(
+        "--emit-prebuilt-bundle",
+        action="store_true",
+        help="write dist/loong64-prebuilts-<version>-electron<version>.tar.gz after the build",
+    )
     build_cmd.add_argument("--no-electron-fallback", action="store_true", help="fail when the exact Electron build is missing")
     build_cmd.add_argument("--no-smoke-test", action="store_true", help="skip running the built application")
     build_cmd.add_argument("--offline", action="store_true", help="never touch the network")
@@ -115,6 +145,19 @@ def build_parser() -> argparse.ArgumentParser:
     publish_cmd.add_argument("--prerelease", action="store_true")
     publish_cmd.add_argument("files", nargs="*", type=Path)
 
+    # -- prebuilts ---------------------------------------------------------------
+    prebuilts_cmd = sub.add_parser(
+        "prebuilts", help="inspect and fetch the portable LoongArch payload bundle"
+    )
+    prebuilts_cmd.add_argument("action", choices=("inspect", "pack", "unpack", "fetch"))
+    prebuilts_cmd.add_argument("archive", nargs="?", type=Path, default=None)
+    prebuilts_cmd.add_argument("--version", dest="bundle_version", default=None)
+    prebuilts_cmd.add_argument("--electron", default=None)
+    prebuilts_cmd.add_argument("--repo", default=None, help="owner/name holding the bundle release")
+    prebuilts_cmd.add_argument("--tag", default=None)
+    prebuilts_cmd.add_argument("--dest", type=Path, default=None)
+    prebuilts_cmd.add_argument("--json", action="store_true")
+
     # -- check -------------------------------------------------------------------
     check = sub.add_parser("should-build", help="exit 0 when a new build is required")
     check.add_argument("version", nargs="?", default="latest")
@@ -142,12 +185,19 @@ def configure_logging(args: argparse.Namespace) -> None:
 
 def cmd_build(args: argparse.Namespace) -> int:
     paths = Paths.create(args.root)
+    if args.prebuilt_bundle:
+        # A bundle supplies every architecture specific payload: the pipeline
+        # returns the bundled ones before reaching any compiler, and the .NET
+        # SDK download would only be dead weight on an x64 runner.
+        args.no_dotnet_download = True
     if args.clean:
         for directory in (paths.work, paths.dist):
             if directory.exists():
                 log("removing %s", directory)
                 shutil.rmtree(directory, ignore_errors=True)
         paths = Paths.create(args.root)
+    if args.no_prebuilt:
+        os.environ["VSCODE_LOONG64_NO_PREBUILT"] = "1"
     config = BuildConfig(
         version=args.version,
         quality=args.quality,
@@ -171,6 +221,11 @@ def cmd_build(args: argparse.Namespace) -> int:
         ripgrep_binary=args.ripgrep,
         os_proxy_resolver_source=args.os_proxy_src,
         os_proxy_features=args.os_proxy_features,
+        rebuild_helpers=not args.no_helpers,
+        prebuilt_dirs=list(args.prebuilt or []),
+        dotnet_download=not args.no_dotnet_download,
+        prebuilt_bundle=args.prebuilt_bundle,
+        emit_prebuilt_bundle=args.emit_prebuilt_bundle,
     )
     result = build(config, verify_app=not args.no_smoke_test)
     if result.manifest_path:
@@ -219,7 +274,7 @@ def doctor_report() -> dict:
         ("python3", True, "node-gyp"),
         ("cargo", True, "static Rust proxy resolver and ripgrep"),
         ("rustc", True, "static Rust proxy resolver and ripgrep"),
-        ("loongarch64-linux-musl-gcc", True, "static musl linking"),
+        ("loongarch64-linux-musl-gcc", False, "static musl linking (optional: the Rust musl target is self-contained)"),
         ("pkg-config", False, "native-keymap"),
         ("file", False, "diagnostics"),
         ("zstd", False, "deb extraction"),
@@ -233,7 +288,7 @@ def doctor_report() -> dict:
         path = shutil.which(name)
         entries.append({"name": name, "found": bool(path), "path": path, "required": required, "hint": hint})
         if required and not path:
-            if name in ("node", "npm", "make", "python3", "cargo", "rustc", "loongarch64-linux-musl-gcc"):
+            if name in ("node", "npm", "make", "python3", "cargo", "rustc"):
                 problems.append(f"{name} is missing: native modules cannot be rebuilt (use --no-natives)")
             else:
                 problems.append(f"{name} is missing: {hint}")
@@ -348,6 +403,37 @@ def cmd_publish(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_prebuilts(args: argparse.Namespace) -> int:
+    from . import prebuilts
+
+    if args.action == "inspect":
+        if not args.archive:
+            raise BuildError("prebuilts inspect requires an archive")
+        print(json.dumps(prebuilts.describe(args.archive), indent=2))
+        return 0
+    if args.action == "unpack":
+        if not args.archive:
+            raise BuildError("prebuilts unpack requires an archive")
+        dest = args.dest or (Paths.create(PROJECT_ROOT).work / "bundle-current")
+        bundle = prebuilts.unpack(args.archive, dest)
+        print(json.dumps({"root": str(bundle.root), "helpers": [str(p) for p in bundle.helpers.values()],
+                          "natives": sorted(bundle.natives)}, indent=2))
+        return 0
+    if args.action == "pack":
+        raise BuildError(
+            "the bundle is written by 'build --emit-prebuilt-bundle' because it needs "
+            "the compiled payloads; run that on a LoongArch host"
+        )
+    if args.action == "fetch":
+        if not args.version:
+            raise BuildError("prebuilts fetch requires --version")
+        runtime = args.electron or "auto"
+        path = prebuilts.fetch(args.version, runtime, repo=args.repo, tag=args.tag, dest=args.dest)
+        print(json.dumps({"archive": str(path)}, indent=2))
+        return 0
+    raise BuildError(f"unknown prebuilts action: {args.action}")
+
+
 def cmd_should_build(args: argparse.Namespace) -> int:
     release = upstream.resolve_version(args.version)
     published = [t for t in (args.published or "").split(",") if t.strip()]
@@ -368,6 +454,7 @@ COMMANDS = {
     "package": cmd_package,
     "publish": cmd_publish,
     "should-build": cmd_should_build,
+    "prebuilts": cmd_prebuilts,
 }
 
 
