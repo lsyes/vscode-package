@@ -26,11 +26,11 @@ on:
         type: boolean
         default: false
   push:
+    branches:
+      - master
     tags:
       - 'v*-loong64'
   schedule:
-    # daily at 02:41 UTC: rebuild the payloads when upstream releases, then
-    # package them
     - cron: '41 2 * * *'
 
 permissions:
