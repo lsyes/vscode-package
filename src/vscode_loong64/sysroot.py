@@ -26,9 +26,25 @@ from .utils import log, warn
 
 #: packages that provide the headers/libs VSCode's native modules need
 DEFAULT_PACKAGES: Dict[str, List[str]] = {
-    "xkbcommon": ["libxkbcommon-dev"],
-    "xkbfile": ["libxkbfile-dev"],
-    "krb5": ["libkrb5-dev", "krb5-multidev"],
+    # The -dev packages ship ``lib*.so -> lib*.so.N`` symlinks whose target is in
+    # the runtime package.  Without it the symlink dangles, the linker silently
+    # falls back to the static ``lib*.a`` and fails on LoongArch relocations.
+    # libx11-dev's x11.pc also requires xcb.pc, and xkbfile.pc requires kbproto.
+    "xkbcommon": [
+        "libxkbcommon-dev",
+        "libxkbcommon0",
+        "libx11-dev",
+        "libx11-6",
+        "libxcb1-dev",
+        "libxcb1",
+        "libxau-dev",
+        "libxau6",
+        "libxdmcp-dev",
+        "libxdmcp6",
+    ],
+    "xkbfile": ["libxkbfile-dev", "libxkbfile1", "x11proto-dev"],
+    # krb5.h pulls in <et/com_err.h> from comerr-dev
+    "krb5": ["libkrb5-dev", "krb5-multidev", "comerr-dev"],
     "sqlite3": ["libsqlite3-dev"],
     "curl": ["libcurl4-openssl-dev"],
 }

@@ -1,0 +1,300 @@
+name: build
+
+# Two-stage build for LoongArch64.
+#
+# `payloads` compiles everything that is architecture specific (native addons,
+# ripgrep and the four standalone helpers: code-tunnel, copilot-shim,
+# apply-seccomp, vsce-sign) on a self-hosted LoongArch runner and publishes a
+# portable bundle.  `package` then runs on an ordinary ubuntu-latest runner,
+# consumes that bundle and only stages, verifies and packages - no compiler is
+# needed there, which is the only way to build on GitHub, since it does not
+# host LoongArch runners.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Upstream version (blank = latest stable)'
+        required: false
+        default: ''
+      publish:
+        description: 'Publish a GitHub release'
+        type: boolean
+        default: true
+      force:
+        description: 'Rebuild the payload bundle even when one already exists'
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'v*-loong64'
+  schedule:
+    # daily at 02:41 UTC: rebuild the payloads when upstream releases, then
+    # package them
+    - cron: '41 2 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-loong64
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: '1'
+  BUNDLE_TAG: loong64-prebuilts
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # fast checks that need no toolchain
+  # ---------------------------------------------------------------------------
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install the builder
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+      - name: Unit checks
+        run: |
+          . .venv/bin/activate
+          make check
+
+  # ---------------------------------------------------------------------------
+  # architecture specific payloads: runs on a LoongArch host
+  # ---------------------------------------------------------------------------
+  payloads:
+    needs: check
+    runs-on: [self-hosted, linux, loong64]
+    timeout-minutes: 300
+    outputs:
+      version: ${{ steps.target.outputs.version }}
+      commit: ${{ steps.target.outputs.commit }}
+      archive: ${{ steps.bundle.outputs.archive }}
+      reused: ${{ steps.exists.outputs.found }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show host
+        run: uname -a && nproc
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential binutils git make curl ca-certificates \
+            python3 python3-pip python3-venv pkg-config zstd xz-utils
+
+      - name: Install Rust targets
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          fi
+          . "$HOME/.cargo/env"
+          rustup target add loongarch64-unknown-linux-gnu loongarch64-unknown-linux-musl
+          rustc --version
+
+      - name: Install the builder
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: Restore payload caches
+        uses: actions/cache@v4
+        with:
+          # helper prebuilts, the fetched cli/ + copilot_shim/ sources, the cargo
+          # registry and the downloaded LoongArch .NET SDK are all reusable
+          path: |
+            .cache/prebuilts
+            .cache/sources
+            .cache/cargo
+            .cache/dotnet
+            .cache/tools
+          key: payloads-${{ runner.os }}-${{ hashFiles('src/vscode_loong64/**', 'src-tools/**') }}
+          restore-keys: |
+            payloads-
+
+      - name: Resolve the target release
+        id: target
+        env:
+          REQUESTED: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          . .venv/bin/activate
+          python -m vscode_loong64.cli info "${REQUESTED:-latest}" > info.json
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          data = json.load(open("info.json"))
+          print("version=" + data["version"])
+          print("commit=" + data["commit"])
+          PY
+
+      - name: Reuse an existing bundle
+        id: exists
+        if: ${{ !inputs.force }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.target.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          prefix="loong64-prebuilts-${VERSION}-electron"
+          if gh release view "$BUNDLE_TAG" >/dev/null 2>&1; then
+            name=$(gh release view "$BUNDLE_TAG" --json assets --jq '.assets[].name' \
+                   | grep "^${prefix}" | head -1 || true)
+          else
+            name=""
+          fi
+          if [ -n "${name}" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            gh release download "$BUNDLE_TAG" -p "${name}" -O "dist/${name}" --clobber
+            echo "downloaded existing bundle ${name}"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build the payload bundle
+        if: steps.exists.outputs.found != 'true'
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
+        run: |
+          set -euo pipefail
+          . .venv/bin/activate
+          make bundle VERSION="$VERSION"
+
+      - name: Publish the payload bundle
+        if: steps.exists.outputs.found != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bundles=(dist/loong64-prebuilts-*.tar.gz)
+          if [ ${#bundles[@]} -eq 0 ]; then
+            echo 'no bundle was produced' >&2
+            exit 1
+          fi
+          # one rolling release holds a bundle per upstream/Electron pair
+          gh release view "$BUNDLE_TAG" >/dev/null 2>&1 || \
+            gh release create "$BUNDLE_TAG" \
+              --title 'LoongArch64 payloads' \
+              --notes 'Architecture specific payloads (native addons, ripgrep, bin/code-tunnel, bin/copilot-shim/copilot, apply-seccomp, vsce-sign) consumed by the packaging job.'
+          gh release upload "$BUNDLE_TAG" "${bundles[@]}" --clobber
+
+      - name: Record the bundle path
+        id: bundle
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bundles=(dist/loong64-prebuilts-*.tar.gz)
+          echo "archive=${bundles[0]}" >> "$GITHUB_OUTPUT"
+          . .venv/bin/activate
+          python -m vscode_loong64.cli prebuilts inspect "${bundles[0]}" > bundle.json
+          python - >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json
+          data = json.load(open("bundle.json"))
+          print(f"- `{data['vscode']}` / Electron `{data['electron']}`: {len(data['entries'])} payloads")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: loong64-prebuilts
+          path: dist/loong64-prebuilts-*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # packaging: runs on x86-64, never installs a compiler
+  # ---------------------------------------------------------------------------
+  package:
+    needs: payloads
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils dpkg-dev fakeroot xz-utils zstd ca-certificates curl
+          # deliberately no compiler: a missing payload must fail loudly
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the builder
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: loong64-prebuilts
+          path: dist
+
+      - name: Package the Debian build
+        env:
+          VERSION: ${{ needs.payloads.outputs.version }}
+        run: |
+          set -euo pipefail
+          . .venv/bin/activate
+          bundle=$(ls dist/loong64-prebuilts-*.tar.gz | head -1)
+          make deb-from-bundle VERSION="$VERSION" BUNDLE="$bundle"
+
+      - name: Check the manifest and the package
+        run: |
+          set -euo pipefail
+          . .venv/bin/activate
+          python - <<'PY'
+          import json
+          import sys
+
+          manifest = json.load(open("dist/manifest.json"))
+          print("version:", manifest["vscode"]["version"], manifest["vscode"]["commit"][:8])
+          print("bundle:", manifest.get("prebuiltBundleInput"))
+          for helper in manifest["nativeModules"].get("helpers", []):
+              print("helper:", helper["name"], helper["status"], helper.get("arch", ""))
+          print("pruned from node_modules.asar:",
+                manifest["nativeModules"].get("asarRemoved", []))
+          failed = [check["name"] for check in manifest["checks"] if not check["ok"]]
+          print("failed checks:", failed)
+          if failed:
+              sys.exit(1)
+          PY
+          deb=$(ls dist/*.deb)
+          test "$(dpkg-deb -f "$deb" Architecture)" = loong64
+          dpkg-deb -c "$deb" | grep -q './usr/share/code/bin/code-tunnel$'
+          dpkg-deb -c "$deb" | grep -q './usr/share/code/bin/copilot-shim/copilot$'
+          dpkg-deb -c "$deb" | grep -q 'vendor/seccomp/loong64/apply-seccomp$'
+          dpkg-deb -c "$deb" | grep -q 'vsce-sign/bin/vsce-sign$'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: code-loong64
+          path: |
+            dist/*.deb
+            dist/*.tar.gz
+            dist/manifest.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish
+        if: inputs.publish || startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          . .venv/bin/activate
+          make publish REPO="${GITHUB_REPOSITORY}"

@@ -396,7 +396,9 @@ class NativeBuilder:
 
         source = self._proxy_source()
         manifest = source / OS_PROXY_RESOLVER_NATIVE_DIR / "Cargo.toml"
+        before = manifest.read_text(encoding="utf-8")
         backend = self._proxy_backend(source)
+        backend_changed = manifest.read_text(encoding="utf-8") != before
         target_dir = self.workdir / "target" / "os-proxy-resolver"
         env = dict(self.env)
         env.update(musltoolchain.gnu_rust_env())
@@ -413,7 +415,11 @@ class NativeBuilder:
             "--manifest-path",
             str(manifest),
         ]
-        if (manifest.parent / "Cargo.lock").exists():
+        # ``--locked`` only works while the checked-in Cargo.lock still matches
+        # the dependency set; after ``_proxy_backend`` rewrites the feature list
+        # cargo has to update the lock file, so the flag is opt-in.
+        lockfile = manifest.parent / "Cargo.lock"
+        if lockfile.exists() and not backend_changed:
             cmd.append("--locked")
         log(
             "building os-proxy-resolver %s for %s (%s backend)",

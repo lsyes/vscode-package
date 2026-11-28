@@ -69,8 +69,22 @@ build:
 deb:
 	$(MAKE) build VERSION="$(VERSION)" FORMATS=deb
 
+# the payload bundle is what an x86-64 packaging host consumes; no artifacts
+# are produced here, so the LoongArch runner spends its time compiling only
 bundle:
-	$(MAKE) build VERSION="$(VERSION)" FORMATS=deb PREBUILT_ARGS=--emit-prebuilt-bundle
+	$(PYTHON) -m vscode_loong64.cli build "$(VERSION)" \
+	  --formats "" \
+	  --emit-prebuilt-bundle \
+	  --no-smoke-test \
+	  --jobs "$(JOBS)" \
+	  $(if $(UPSTREAM),--upstream "$(UPSTREAM)",) \
+	  $(if $(UPSTREAM_DIR),--upstream-dir "$(UPSTREAM_DIR)",) \
+	  $(if $(ELECTRON_ARCHIVE),--electron-archive "$(ELECTRON_ARCHIVE)",) \
+	  $(if $(RIPGREP),--ripgrep "$(RIPGREP)",) \
+	  $(if $(OS_PROXY_SRC),--os-proxy-src "$(OS_PROXY_SRC)",) \
+	  $(if $(PREBUILT),--prebuilt "$(PREBUILT)",) \
+	  $(PREBUILT_ARGS) \
+	  $(EXTRA_ARGS)
 
 deb-from-bundle:
 	@test -n "$(BUNDLE)" || (echo 'BUNDLE is required (dist/loong64-prebuilts-*.tar.gz)' >&2; exit 2)

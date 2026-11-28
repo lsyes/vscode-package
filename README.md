@@ -162,8 +162,12 @@ Build on a LoongArch64 machine (or a matching LoongArch runner) with:
 - optionally `loongarch64-linux-musl-gcc`: the Rust `loongarch64-unknown-linux-musl`
   target ships its own musl + crt objects, so a plain `gcc` links the static
   helpers; the cross driver is only preferred when present
-- `pkg-config`, plus development headers required by VS Code's addons
-  (`libxkbcommon-dev`, `libxkbfile-dev`, `libkrb5-dev`, `krb5-multidev`)
+- `pkg-config`, plus development headers required by VS Code's addons. They are
+  downloaded automatically into a private sysroot (`apt-get download`, no root);
+  the set is declared in `src/vscode_loong64/sysroot.py` and includes the
+  runtime `lib*.so.N` packages, because a `-dev` package only ships
+  `lib*.so -> lib*.so.N` symlinks and a dangling symlink makes the linker fall
+  back to the static archive, which fails on LoongArch relocations
 
 On Debian/Ubuntu:
 
@@ -312,12 +316,22 @@ slipping into a package.
 
 ## Continuous integration
 
-The compile steps need a LoongArch machine; the packaging steps do not. Since
-no hosted runner is LoongArch, the recommended split is a periodic job on a
-LoongArch box (or a QEMU/container job) that only runs `make bundle`, plus an
-ordinary `ubuntu-latest` job that consumes the bundle with
-`make deb-from-bundle` and publishes. Independently of where they run, the
-builder itself already:
+[`.github/workflows/build.yml`](.github/workflows/build.yml) implements the
+split that the missing LoongArch runners require:
+
+| Job | Runner | What it does |
+| --- | --- | --- |
+| `check` | `ubuntu-latest` | `make check` (syntax + 65 unit tests) |
+| `payloads` | `self-hosted, linux, loong64` | resolves the release, rebuilds the addons/ripgrep/helpers, publishes `dist/loong64-prebuilts-*.tar.gz` to the rolling `loong64-prebuilts` release |
+| `package` | `ubuntu-latest` | downloads the bundle, runs `make deb-from-bundle`, re-checks the manifest and the four helpers, uploads the `.deb`, publishes |
+
+The `payloads` job reuses an existing bundle for the same upstream version
+unless `force` is set, and caches `.cache/prebuilts`, `.cache/sources`,
+`.cache/cargo`, `.cache/dotnet` and `.cache/tools` between runs, so a warm
+LoongArch runner only recompiles what actually changed. Triggers: manual
+dispatch, `v*-loong64` tags, and a daily schedule.
+
+Independently of where they run, the builder itself already:
 
 - compares the payload with the newest upstream release and records the delta
   (`upstreamChange` in the manifest), so "nothing changed" is visible without a
@@ -329,9 +343,9 @@ builder itself already:
   recompile the tunnel CLI and the shim on every run.
 
 Publishing uses the repository-scoped `GITHUB_TOKEN`
-(`make publish REPO=owner/name TAG=v<version>-loong64`), and the workflow needs
-**Actions > General > Workflow permissions** set to read and write when the
-organization does not grant that by default.
+(`make publish REPO=owner/name TAG=v<version>-loong64`), so
+**Actions > General > Workflow permissions** has to allow read and write when
+the organization does not grant that by default.
 
 ## Reliability notes
 
